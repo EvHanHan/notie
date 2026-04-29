@@ -49,11 +49,30 @@ static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
 }
 @end
 
+@interface ClickableTextField : NSTextField
+@property (nonatomic, copy) void (^clickHandler)(void);
+@end
+
+@implementation ClickableTextField
+- (void)mouseDown:(NSEvent *)event {
+    if (self.clickHandler) {
+        self.clickHandler();
+        return;
+    }
+    [super mouseDown:event];
+}
+
+- (void)resetCursorRects {
+    [self addCursorRect:self.bounds cursor:NSCursor.pointingHandCursor];
+}
+@end
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSTextViewDelegate>
 @property NSStatusItem *statusItem;
 @property NSWindow *window;
 @property CaptureTextView *textView;
-@property NSTextField *targetLabel;
+@property ClickableTextField *targetLabel;
+@property NSButton *chooseButton;
 @property NSView *bottomBar;
 @property NSMutableArray<NSDictionary *> *pendingImages;
 @property NSMapTable<NSTextAttachment *, NSString *> *attachmentImageIDs;
@@ -98,7 +117,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)buildWindow {
-    NSRect frame = NSMakeRect(0, 0, 500, 292);
+    NSRect frame = NSMakeRect(0, 0, 500, 168);
     self.window = [[NSWindow alloc] initWithContentRect:frame styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable) backing:NSBackingStoreBuffered defer:NO];
     self.window.title = @"Notie";
     self.window.level = NSFloatingWindowLevel;
@@ -125,8 +144,12 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     scrollView.drawsBackground = YES;
     scrollView.backgroundColor = NSColor.textBackgroundColor;
     scrollView.hasVerticalScroller = YES;
+    scrollView.autohidesScrollers = YES;
+    scrollView.scrollerStyle = NSScrollerStyleOverlay;
     self.textView = [[CaptureTextView alloc] initWithFrame:scrollView.bounds];
-    self.textView.font = [NSFont systemFontOfSize:15];
+    NSFont *spotlightLikeFont = [NSFont systemFontOfSize:22 weight:NSFontWeightRegular];
+    self.textView.font = spotlightLikeFont;
+    self.textView.typingAttributes = @{NSFontAttributeName: spotlightLikeFont, NSForegroundColorAttributeName: NSColor.labelColor};
     self.textView.textColor = NSColor.labelColor;
     self.textView.backgroundColor = NSColor.textBackgroundColor;
     self.textView.textContainerInset = NSMakeSize(14, 12);
@@ -147,20 +170,22 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     scrollView.documentView = self.textView;
     [content addSubview:scrollView];
 
-    NSButton *chooseButton = [NSButton buttonWithTitle:@"Choose File…" target:self action:@selector(chooseMarkdownFile:)];
-    chooseButton.frame = NSMakeRect(12, 10, 112, 32);
-    [self.bottomBar addSubview:chooseButton];
+    self.chooseButton = [NSButton buttonWithTitle:@"Choose File…" target:self action:@selector(chooseMarkdownFile:)];
+    self.chooseButton.frame = NSMakeRect(12, 10, 112, 32);
+    [self.bottomBar addSubview:self.chooseButton];
 
-    self.targetLabel = [NSTextField labelWithString:[self targetDescription]];
+    self.targetLabel = [ClickableTextField labelWithString:[self targetDescription]];
     self.targetLabel.textColor = NSColor.secondaryLabelColor;
     self.targetLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    self.targetLabel.frame = NSMakeRect(132, 16, 180, 20);
+    self.targetLabel.toolTip = @"Click to choose a Markdown file";
+    self.targetLabel.clickHandler = ^{ [weakSelf chooseMarkdownFile:nil]; };
     [self.bottomBar addSubview:self.targetLabel];
 
     NSButton *saveButton = [NSButton buttonWithTitle:@"Save  ⌘ ↩" target:self action:@selector(saveNote:)];
     saveButton.keyEquivalent = @"\r";
     saveButton.frame = NSMakeRect(328, 10, 160, 32);
     [self.bottomBar addSubview:saveButton];
+    [self updateTargetControls];
 }
 
 - (void)registerHotKey {
@@ -180,6 +205,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [self.pendingImages removeAllObjects];
     [self.attachmentImageIDs removeAllObjects];
     self.targetLabel.stringValue = [self targetDescription];
+    [self updateTargetControls];
     [self.window makeFirstResponder:self.textView];
 }
 
@@ -210,19 +236,23 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
     if (addedCount == 0) return NO;
     self.targetLabel.stringValue = [self targetDescription];
+    [self updateTargetControls];
+    [self refocusCaptureWindow];
     return YES;
 }
 
 - (void)insertImagePreview:(NSImage *)image name:(NSString *)name imageID:(NSString *)imageID {
-    NSMutableAttributedString *insertion = [[NSMutableAttributedString alloc] initWithString:@"\n"];
+    NSMutableAttributedString *insertion = [[NSMutableAttributedString alloc] initWithString:@"\n" attributes:self.textView.typingAttributes];
     NSTextAttachment *attachment = [NSTextAttachment new];
     attachment.image = [self previewImageForImage:image ?: [self placeholderImageWithName:name]];
     [self.attachmentImageIDs setObject:imageID forKey:attachment];
     [insertion appendAttributedString:[NSAttributedString attributedStringWithAttachment:attachment]];
-    [insertion appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"]];
+    [insertion appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:self.textView.typingAttributes]];
     NSRange replacementRange = self.textView.selectedRange;
+    NSDictionary *typingAttributes = self.textView.typingAttributes;
     [self.textView.textStorage replaceCharactersInRange:replacementRange withAttributedString:insertion];
     self.textView.selectedRange = NSMakeRange(replacementRange.location + insertion.length, 0);
+    self.textView.typingAttributes = typingAttributes;
 }
 
 - (NSImage *)placeholderImageWithName:(NSString *)name {
@@ -261,7 +291,14 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     panel.canCreateDirectories = YES;
     panel.allowedFileTypes = @[@"md", @"markdown", @"txt"];
 
-    if ([panel runModal] != NSModalResponseOK) return;
+    NSURL *currentURL = [self currentMarkdownFileURL];
+    if (currentURL) {
+        panel.directoryURL = currentURL;
+        panel.nameFieldStringValue = currentURL.lastPathComponent ?: @"";
+    }
+
+    NSInteger response = [panel runModal];
+    if (response != NSModalResponseOK) return;
 
     NSURL *fileURL = panel.URL;
     NSError *error = nil;
@@ -275,6 +312,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [defaults setObject:bookmark forKey:MarkdownFileBookmarkKey];
     [defaults setObject:fileURL.path forKey:MarkdownFilePathKey];
     self.targetLabel.stringValue = [self targetDescription];
+    [self updateTargetControls];
 }
 
 - (void)saveNote:(id)sender {
@@ -332,6 +370,24 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
 - (void)textDidChange:(NSNotification *)notification {
     self.targetLabel.stringValue = [self targetDescription];
+    [self updateTargetControls];
+}
+
+- (void)refocusCaptureWindow {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSApp activateIgnoringOtherApps:YES];
+        [self.window makeKeyAndOrderFront:nil];
+        [self.window makeFirstResponder:self.textView];
+    });
+}
+
+- (void)updateTargetControls {
+    NSString *path = [NSUserDefaults.standardUserDefaults stringForKey:MarkdownFilePathKey];
+    BOOL hasMarkdownFile = path.length > 0;
+    self.chooseButton.hidden = YES;
+    self.targetLabel.stringValue = [self targetDescription];
+    self.targetLabel.toolTip = hasMarkdownFile ? @"Click to choose a different Markdown file" : @"Click to choose a Markdown file";
+    self.targetLabel.frame = NSMakeRect(12, 16, 300, 20);
 }
 
 - (BOOL)appendEntryWithBody:(NSString *)body images:(NSArray<NSDictionary *> *)images error:(NSError **)outError {
@@ -487,13 +543,20 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     return nil;
 }
 
+- (NSURL *)currentMarkdownFileURL {
+    NSString *path = [NSUserDefaults.standardUserDefaults stringForKey:MarkdownFilePathKey];
+    if (path.length == 0) return nil;
+    return [NSURL fileURLWithPath:path];
+}
+
 - (NSString *)targetDescription {
     NSString *path = [NSUserDefaults.standardUserDefaults stringForKey:MarkdownFilePathKey];
     if (path.length == 0) return @"No Markdown file selected.";
+    NSString *filename = path.lastPathComponent.length > 0 ? path.lastPathComponent : path;
     NSUInteger imageCount = [self visibleImageCount];
-    if (imageCount == 1) return [NSString stringWithFormat:@"Target: %@ • 1 image", path];
-    if (imageCount > 1) return [NSString stringWithFormat:@"Target: %@ • %lu images", path, (unsigned long)imageCount];
-    return [NSString stringWithFormat:@"Target: %@", path];
+    if (imageCount == 1) return [NSString stringWithFormat:@"%@ • 1 image", filename];
+    if (imageCount > 1) return [NSString stringWithFormat:@"%@ • %lu images", filename, (unsigned long)imageCount];
+    return filename;
 }
 
 - (void)showErrorWithTitle:(NSString *)title message:(NSString *)message {
