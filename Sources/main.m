@@ -3,6 +3,9 @@
 
 static NSString * const MarkdownFileBookmarkKey = @"MarkdownFileBookmark";
 static NSString * const MarkdownFilePathKey = @"MarkdownFilePath";
+static NSString * const SaveDestinationKey = @"SaveDestination";
+static NSString * const SaveDestinationMarkdown = @"markdown";
+static NSString * const SaveDestinationAppleNotes = @"appleNotes";
 static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
 
 @interface CaptureTextView : NSTextView
@@ -71,6 +74,7 @@ static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
 @property NSStatusItem *statusItem;
 @property NSWindow *window;
 @property CaptureTextView *textView;
+@property NSPopUpButton *destinationPopUp;
 @property ClickableTextField *targetLabel;
 @property NSButton *chooseButton;
 @property NSView *bottomBar;
@@ -109,7 +113,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
     NSMenu *menu = [NSMenu new];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"New Note" action:@selector(showCaptureWindow:) keyEquivalent:@"k"]];
-    [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Append to Markdown" action:@selector(saveNote:) keyEquivalent:@"\r"]];
+    [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Save Note" action:@selector(saveNote:) keyEquivalent:@"\r"]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Choose Markdown File…" action:@selector(chooseMarkdownFile:) keyEquivalent:@"o"]];
     [menu addItem:[NSMenuItem separatorItem]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Quit" action:@selector(quit:) keyEquivalent:@"q"]];
@@ -170,8 +174,17 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     scrollView.documentView = self.textView;
     [content addSubview:scrollView];
 
+    self.destinationPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(12, 10, 146, 32) pullsDown:NO];
+    [self.destinationPopUp addItemWithTitle:@"Write to File"];
+    [self.destinationPopUp addItemWithTitle:@"Apple Notes"];
+    [self.destinationPopUp itemAtIndex:0].representedObject = SaveDestinationMarkdown;
+    [self.destinationPopUp itemAtIndex:1].representedObject = SaveDestinationAppleNotes;
+    self.destinationPopUp.target = self;
+    self.destinationPopUp.action = @selector(destinationChanged:);
+    [self.bottomBar addSubview:self.destinationPopUp];
+
     self.chooseButton = [NSButton buttonWithTitle:@"Choose File…" target:self action:@selector(chooseMarkdownFile:)];
-    self.chooseButton.frame = NSMakeRect(12, 10, 112, 32);
+    self.chooseButton.frame = NSMakeRect(166, 10, 112, 32);
     [self.bottomBar addSubview:self.chooseButton];
 
     self.targetLabel = [ClickableTextField labelWithString:[self targetDescription]];
@@ -207,6 +220,13 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.targetLabel.stringValue = [self targetDescription];
     [self updateTargetControls];
     [self.window makeFirstResponder:self.textView];
+}
+
+- (void)destinationChanged:(id)sender {
+    NSString *destination = self.destinationPopUp.selectedItem.representedObject ?: SaveDestinationMarkdown;
+    [NSUserDefaults.standardUserDefaults setObject:destination forKey:SaveDestinationKey];
+    [self updateTargetControls];
+    [self refocusCaptureWindow];
 }
 
 - (BOOL)addPendingImagesFromPasteboard:(NSPasteboard *)pasteboard {
@@ -324,15 +344,18 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     }
 
     NSError *error = nil;
-    if ([self appendEntryWithBody:body images:visibleImages error:&error]) {
+    NSString *destination = [self selectedSaveDestination];
+    BOOL saved = [destination isEqualToString:SaveDestinationAppleNotes] ? [self createAppleNoteWithBody:body images:visibleImages error:&error] : [self appendEntryWithBody:body images:visibleImages error:&error];
+    if (saved) {
         [self.window close];
         [self.pendingImages removeAllObjects];
         NSUserNotification *notification = [NSUserNotification new];
-        notification.title = @"Saved to Markdown";
-        notification.informativeText = [self targetDescription];
+        notification.title = [destination isEqualToString:SaveDestinationAppleNotes] ? @"Saved to Apple Notes" : @"Saved to Markdown";
+        notification.informativeText = [destination isEqualToString:SaveDestinationAppleNotes] ? [self appleNoteTitleForBody:body images:visibleImages] : [self targetDescription];
         [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
     } else {
-        [self showErrorWithTitle:@"Couldn’t save to Markdown" message:error.localizedDescription ?: @"Unknown error."];
+        NSString *title = [destination isEqualToString:SaveDestinationAppleNotes] ? @"Couldn’t save to Apple Notes" : @"Couldn’t save to Markdown";
+        [self showErrorWithTitle:title message:error.localizedDescription ?: @"Unknown error."];
     }
 }
 
@@ -384,10 +407,151 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (void)updateTargetControls {
     NSString *path = [NSUserDefaults.standardUserDefaults stringForKey:MarkdownFilePathKey];
     BOOL hasMarkdownFile = path.length > 0;
+    NSString *destination = [self selectedSaveDestination];
+    BOOL savesToAppleNotes = [destination isEqualToString:SaveDestinationAppleNotes];
+    [self.destinationPopUp selectItemWithTitle:(savesToAppleNotes ? @"Apple Notes" : @"Write to File")];
     self.chooseButton.hidden = YES;
-    self.targetLabel.stringValue = [self targetDescription];
-    self.targetLabel.toolTip = hasMarkdownFile ? @"Click to choose a different Markdown file" : @"Click to choose a Markdown file";
-    self.targetLabel.frame = NSMakeRect(12, 16, 300, 20);
+    self.targetLabel.stringValue = savesToAppleNotes ? [self appleNotesDescription] : [self targetDescription];
+    self.targetLabel.toolTip = savesToAppleNotes ? @"Creates a new note in Apple Notes" : (hasMarkdownFile ? @"Click to choose a different Markdown file" : @"Click to choose a Markdown file");
+    __weak AppDelegate *weakSelf = self;
+    self.targetLabel.clickHandler = savesToAppleNotes ? nil : ^{ [weakSelf chooseMarkdownFile:nil]; };
+    self.targetLabel.frame = NSMakeRect(166, 16, 150, 20);
+}
+
+- (NSString *)selectedSaveDestination {
+    NSString *destination = [NSUserDefaults.standardUserDefaults stringForKey:SaveDestinationKey];
+    if ([destination isEqualToString:SaveDestinationAppleNotes]) return SaveDestinationAppleNotes;
+    return SaveDestinationMarkdown;
+}
+
+- (BOOL)createAppleNoteWithBody:(NSString *)body images:(NSArray<NSDictionary *> *)images error:(NSError **)outError {
+    NSString *title = [self appleNoteTitleForBody:body images:images];
+    NSString *html = [self appleNoteHTMLForBody:body images:images];
+    NSString *scriptSource = [NSString stringWithFormat:@"tell application \"Notes\"\nmake new note at folder \"Notes\" of default account with properties {body:%@}\nend tell", [self appleScriptLiteralForString:html]];
+    NSAppleScript *script = [[NSAppleScript alloc] initWithSource:scriptSource];
+    NSDictionary *errorInfo = nil;
+    [script executeAndReturnError:&errorInfo];
+    if (!errorInfo) return YES;
+
+    NSInteger errorNumber = [errorInfo[NSAppleScriptErrorNumber] integerValue];
+    if (errorNumber != -1728 && errorNumber != -10004) {
+        if (outError) *outError = [self errorFromAppleScriptErrorInfo:errorInfo fallback:@"Apple Notes could not create the note."];
+        return NO;
+    }
+
+    NSString *fallbackSource = [NSString stringWithFormat:@"tell application \"Notes\"\nmake new note with properties {body:%@}\nend tell", [self appleScriptLiteralForString:html]];
+    NSAppleScript *fallbackScript = [[NSAppleScript alloc] initWithSource:fallbackSource];
+    NSDictionary *fallbackErrorInfo = nil;
+    [fallbackScript executeAndReturnError:&fallbackErrorInfo];
+    if (!fallbackErrorInfo) return YES;
+    if (outError) *outError = [self errorFromAppleScriptErrorInfo:fallbackErrorInfo fallback:@"Apple Notes could not create the note."];
+    return NO;
+}
+
+- (NSError *)errorFromAppleScriptErrorInfo:(NSDictionary *)errorInfo fallback:(NSString *)fallback {
+    NSString *message = errorInfo[NSAppleScriptErrorMessage] ?: fallback;
+    NSInteger code = [errorInfo[NSAppleScriptErrorNumber] integerValue];
+    return [NSError errorWithDomain:@"Notie" code:code userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+- (NSString *)appleNoteTitleForBody:(NSString *)body images:(NSArray<NSDictionary *> *)images {
+    NSArray<NSString *> *lines = [body componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
+    for (NSString *line in lines) {
+        NSString *trimmedLine = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (trimmedLine.length > 0) return [self truncatedString:trimmedLine maximumLength:80];
+    }
+    if (images.count == 1) return @"Notie image";
+    if (images.count > 1) return [NSString stringWithFormat:@"Notie images (%lu)", (unsigned long)images.count];
+    return @"Notie note";
+}
+
+- (NSString *)appleNoteHTMLForBody:(NSString *)body images:(NSArray<NSDictionary *> *)images {
+    NSMutableString *html = [NSMutableString stringWithString:@"<html><body>"];
+    NSString *trimmedBody = [body stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (trimmedBody.length > 0) {
+        NSArray<NSString *> *paragraphs = [trimmedBody componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
+        for (NSString *paragraph in paragraphs) {
+            NSString *trimmedParagraph = [paragraph stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (trimmedParagraph.length == 0) continue;
+            [html appendFormat:@"<p>%@</p>", [self htmlEscapedString:trimmedParagraph]];
+        }
+    }
+    for (NSDictionary *imageInfo in images) {
+        NSString *dataURL = [self appleNoteImageDataURLForImage:imageInfo];
+        NSString *name = [self htmlEscapedString:imageInfo[@"name"] ?: @"image"];
+        if (dataURL.length > 0) {
+            [html appendFormat:@"<p><img src=\"%@\" alt=\"%@\" style=\"max-width:640px;\"></p>", dataURL, name];
+        } else {
+            [html appendFormat:@"<p>Image: %@</p>", name];
+        }
+    }
+    [html appendString:@"</body></html>"];
+    return html;
+}
+
+- (NSString *)appleNoteImageDataURLForImage:(NSDictionary *)imageInfo {
+    NSData *imageData = nil;
+    NSString *mimeType = @"image/png";
+    NSURL *sourceURL = imageInfo[@"url"];
+    if (sourceURL) {
+        imageData = [NSData dataWithContentsOfURL:sourceURL];
+        mimeType = [self mimeTypeForImageExtension:sourceURL.pathExtension];
+    } else {
+        NSImage *image = imageInfo[@"image"];
+        CGImageRef cgImage = [image CGImageForProposedRect:NULL context:nil hints:nil];
+        if (cgImage) {
+            NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithCGImage:cgImage];
+            imageData = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+        }
+    }
+    if (imageData.length == 0) return nil;
+    return [NSString stringWithFormat:@"data:%@;base64,%@", mimeType, [imageData base64EncodedStringWithOptions:0]];
+}
+
+- (NSString *)mimeTypeForImageExtension:(NSString *)extension {
+    NSString *lowercaseExtension = extension.lowercaseString;
+    if ([lowercaseExtension isEqualToString:@"jpg"] || [lowercaseExtension isEqualToString:@"jpeg"]) return @"image/jpeg";
+    if ([lowercaseExtension isEqualToString:@"gif"]) return @"image/gif";
+    if ([lowercaseExtension isEqualToString:@"heic"]) return @"image/heic";
+    if ([lowercaseExtension isEqualToString:@"tif"] || [lowercaseExtension isEqualToString:@"tiff"]) return @"image/tiff";
+    if ([lowercaseExtension isEqualToString:@"bmp"]) return @"image/bmp";
+    if ([lowercaseExtension isEqualToString:@"webp"]) return @"image/webp";
+    return @"image/png";
+}
+
+- (NSString *)appleNotesDescription {
+    NSUInteger imageCount = [self visibleImageCount];
+    if (imageCount == 1) return @"New Apple note • 1 image name";
+    if (imageCount > 1) return [NSString stringWithFormat:@"New Apple note • %lu image names", (unsigned long)imageCount];
+    return @"New Apple note";
+}
+
+- (NSString *)truncatedString:(NSString *)string maximumLength:(NSUInteger)maximumLength {
+    if (string.length <= maximumLength) return string;
+    return [[string substringToIndex:maximumLength - 1] stringByAppendingString:@"…"];
+}
+
+- (NSString *)htmlEscapedString:(NSString *)string {
+    NSMutableString *escaped = [string mutableCopy] ?: [NSMutableString string];
+    [escaped replaceOccurrencesOfString:@"&" withString:@"&amp;" options:0 range:NSMakeRange(0, escaped.length)];
+    [escaped replaceOccurrencesOfString:@"<" withString:@"&lt;" options:0 range:NSMakeRange(0, escaped.length)];
+    [escaped replaceOccurrencesOfString:@">" withString:@"&gt;" options:0 range:NSMakeRange(0, escaped.length)];
+    [escaped replaceOccurrencesOfString:@"\"" withString:@"&quot;" options:0 range:NSMakeRange(0, escaped.length)];
+    return escaped;
+}
+
+- (NSString *)appleScriptLiteralForString:(NSString *)string {
+    NSMutableString *literal = [NSMutableString stringWithString:@"\""];
+    NSArray<NSString *> *parts = [string componentsSeparatedByString:@"\""];
+    for (NSUInteger index = 0; index < parts.count; index++) {
+        NSString *part = parts[index];
+        NSMutableString *escapedPart = [part mutableCopy] ?: [NSMutableString string];
+        [escapedPart replaceOccurrencesOfString:@"\\" withString:@"\\\\" options:0 range:NSMakeRange(0, escapedPart.length)];
+        [literal appendString:escapedPart];
+        if (index + 1 < parts.count) [literal appendString:@"\\\""];
+    }
+    [literal appendString:@"\""];
+    return literal;
 }
 
 - (BOOL)appendEntryWithBody:(NSString *)body images:(NSArray<NSDictionary *> *)images error:(NSError **)outError {
