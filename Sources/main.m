@@ -8,6 +8,26 @@ static NSString * const SaveDestinationMarkdown = @"markdown";
 static NSString * const SaveDestinationAppleNotes = @"appleNotes";
 static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
 
+static NSSet<NSString *> *NotieImageFileExtensions(void) {
+    static NSSet<NSString *> *extensions;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        extensions = [NSSet setWithArray:@[@"png", @"jpg", @"jpeg", @"gif", @"heic", @"tif", @"tiff", @"bmp", @"webp"]];
+    });
+    return extensions;
+}
+
+static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
+    static NSArray<NSPasteboardType> *types;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSMutableArray<NSPasteboardType> *imageTypes = [NSMutableArray arrayWithArray:NSImage.imageTypes];
+        [imageTypes addObjectsFromArray:@[NSPasteboardTypePNG, NSPasteboardTypeTIFF, @"public.jpeg", @"public.heic", @"public.webp", @"com.compuserve.gif"]];
+        types = [imageTypes copy];
+    });
+    return types;
+}
+
 @interface CaptureTextView : NSTextView
 @property (nonatomic, copy) void (^commandReturnHandler)(void);
 @property (nonatomic, copy) void (^escapeHandler)(void);
@@ -16,9 +36,13 @@ static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
 
 @implementation CaptureTextView
 - (void)keyDown:(NSEvent *)event {
-    if (event.keyCode == 36 && (event.modifierFlags & NSEventModifierFlagCommand)) {
+    BOOL commandDown = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
+    if (event.keyCode == 36 && commandDown) {
         if (self.commandReturnHandler) self.commandReturnHandler();
         return;
+    }
+    if (event.keyCode == 9 && commandDown) {
+        if (self.pasteboardImageHandler && self.pasteboardImageHandler(NSPasteboard.generalPasteboard)) return;
     }
     if (event.keyCode == 53) {
         if (self.escapeHandler) self.escapeHandler();
@@ -42,11 +66,12 @@ static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
 }
 
 - (BOOL)pasteboardLooksLikeImage:(NSPasteboard *)pasteboard {
-    if ([[pasteboard types] containsObject:NSPasteboardTypePNG] || [[pasteboard types] containsObject:NSPasteboardTypeTIFF]) return YES;
+    for (NSPasteboardType type in NotiePasteboardImageTypes()) {
+        if ([[pasteboard types] containsObject:type]) return YES;
+    }
     NSArray<NSURL *> *urls = [pasteboard readObjectsForClasses:@[NSURL.class] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-    NSSet<NSString *> *extensions = [NSSet setWithArray:@[@"png", @"jpg", @"jpeg", @"gif", @"heic", @"tif", @"tiff", @"bmp", @"webp"]];
     for (NSURL *url in urls) {
-        if ([extensions containsObject:url.pathExtension.lowercaseString]) return YES;
+        if ([NotieImageFileExtensions() containsObject:url.pathExtension.lowercaseString]) return YES;
     }
     return NO;
 }
@@ -78,6 +103,7 @@ static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
 @property ClickableTextField *targetLabel;
 @property NSButton *chooseButton;
 @property NSView *bottomBar;
+@property NSTextField *pasteLogLabel;
 @property NSMutableArray<NSDictionary *> *pendingImages;
 @property NSMapTable<NSTextAttachment *, NSString *> *attachmentImageIDs;
 @property EventHotKeyRef hotKeyRef;
@@ -121,7 +147,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)buildWindow {
-    NSRect frame = NSMakeRect(0, 0, 500, 168);
+    NSRect frame = NSMakeRect(0, 0, 500, 206);
     self.window = [[NSWindow alloc] initWithContentRect:frame styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable) backing:NSBackingStoreBuffered defer:NO];
     self.window.title = @"Notie";
     self.window.level = NSFloatingWindowLevel;
@@ -143,7 +169,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     divider.boxType = NSBoxSeparator;
     [content addSubview:divider];
 
-    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 53, frame.size.width, frame.size.height - 53)];
+    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 81, frame.size.width, frame.size.height - 81)];
     scrollView.borderType = NSNoBorder;
     scrollView.drawsBackground = YES;
     scrollView.backgroundColor = NSColor.textBackgroundColor;
@@ -173,6 +199,15 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [self.textView registerForDraggedTypes:@[NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF]];
     scrollView.documentView = self.textView;
     [content addSubview:scrollView];
+
+    self.pasteLogLabel = [NSTextField labelWithString:@"Paste log: ready"];
+    self.pasteLogLabel.frame = NSMakeRect(12, 57, frame.size.width - 24, 18);
+    self.pasteLogLabel.autoresizingMask = NSViewWidthSizable;
+    self.pasteLogLabel.font = [NSFont systemFontOfSize:11];
+    self.pasteLogLabel.textColor = NSColor.secondaryLabelColor;
+    self.pasteLogLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    self.pasteLogLabel.toolTip = @"Shows what Notie saw during the latest paste or drop.";
+    [content addSubview:self.pasteLogLabel];
 
     self.destinationPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(12, 10, 146, 32) pullsDown:NO];
     [self.destinationPopUp addItemWithTitle:@"Write to File"];
@@ -215,6 +250,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
     self.textView.string = @"";
+    self.pasteLogLabel.stringValue = @"Paste log: ready";
     [self.pendingImages removeAllObjects];
     [self.attachmentImageIDs removeAllObjects];
     self.targetLabel.stringValue = [self targetDescription];
@@ -231,34 +267,78 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
 - (BOOL)addPendingImagesFromPasteboard:(NSPasteboard *)pasteboard {
     NSArray<NSURL *> *urls = [pasteboard readObjectsForClasses:@[NSURL.class] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-    NSSet<NSString *> *extensions = [NSSet setWithArray:@[@"png", @"jpg", @"jpeg", @"gif", @"heic", @"tif", @"tiff", @"bmp", @"webp"]];
+    [self updatePasteLogWithFormat:@"Paste seen: types=%@, file URLs=%lu", [pasteboard.types componentsJoinedByString:@", "], (unsigned long)urls.count];
     NSUInteger addedCount = 0;
     for (NSURL *url in urls) {
-        if (![extensions containsObject:url.pathExtension.lowercaseString]) continue;
+        if (![NotieImageFileExtensions() containsObject:url.pathExtension.lowercaseString]) {
+            [self updatePasteLogWithFormat:@"Skipped file: %@ is not a supported image", url.lastPathComponent ?: url.path];
+            continue;
+        }
         NSImage *image = [[NSImage alloc] initWithContentsOfURL:url];
+        if (!image) {
+            [self updatePasteLogWithFormat:@"Could not read image file: %@", url.lastPathComponent ?: url.path];
+            continue;
+        }
         NSString *imageID = NSUUID.UUID.UUIDString;
         NSString *name = url.lastPathComponent ?: @"image";
         [self.pendingImages addObject:@{@"url": url, @"name": name, @"id": imageID}];
         [self insertImagePreview:image name:name imageID:imageID];
+        [self updatePasteLogWithFormat:@"Added image file: %@", name];
         addedCount++;
     }
 
     if (addedCount == 0) {
-        NSImage *image = [[NSImage alloc] initWithPasteboard:pasteboard];
+        NSImage *image = [self imageFromPasteboard:pasteboard];
         if (image) {
             NSString *name = [NSString stringWithFormat:@"screenshot-%@.png", [self timestampString]];
             NSString *imageID = NSUUID.UUID.UUIDString;
             [self.pendingImages addObject:@{@"image": image, @"name": name, @"id": imageID}];
             [self insertImagePreview:image name:name imageID:imageID];
+            [self updatePasteLogWithFormat:@"Added clipboard image: %@ (%@)", name, NSStringFromSize(image.size)];
             addedCount++;
         }
     }
 
-    if (addedCount == 0) return NO;
+    if (addedCount == 0) {
+        [self updatePasteLogWithFormat:@"No image found in paste. Types: %@", [pasteboard.types componentsJoinedByString:@", "]];
+        return NO;
+    }
     self.targetLabel.stringValue = [self targetDescription];
     [self updateTargetControls];
     [self refocusCaptureWindow];
     return YES;
+}
+
+- (NSImage *)imageFromPasteboard:(NSPasteboard *)pasteboard {
+    NSImage *image = [[NSImage alloc] initWithPasteboard:pasteboard];
+    if (image) {
+        [self updatePasteLogWithFormat:@"Decoded image with NSImage pasteboard reader: %@", NSStringFromSize(image.size)];
+        return image;
+    }
+
+    for (NSPasteboardItem *item in pasteboard.pasteboardItems) {
+        for (NSPasteboardType type in NotiePasteboardImageTypes()) {
+            NSData *data = [item dataForType:type];
+            if (data.length == 0) continue;
+            image = [[NSImage alloc] initWithData:data];
+            if (image) {
+                [self updatePasteLogWithFormat:@"Decoded image data as %@: %@ bytes", type, @(data.length)];
+                return image;
+            }
+        }
+    }
+    return nil;
+}
+
+- (void)updatePasteLogWithFormat:(NSString *)format, ... {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"Paste log: %@", message ?: @"ready"];
+    self.pasteLogLabel.stringValue = line;
+    self.pasteLogLabel.toolTip = line;
+    NSLog(@"[Notie] %@", message);
 }
 
 - (void)insertImagePreview:(NSImage *)image name:(NSString *)name imageID:(NSString *)imageID {
@@ -427,11 +507,11 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (BOOL)createAppleNoteWithBody:(NSString *)body images:(NSArray<NSDictionary *> *)images error:(NSError **)outError {
     NSString *title = [self appleNoteTitleForBody:body images:images];
     NSString *html = [self appleNoteHTMLForBody:body images:images];
-    NSString *scriptSource = [NSString stringWithFormat:@"tell application \"Notes\"\nmake new note at folder \"Notes\" of default account with properties {body:%@}\nend tell", [self appleScriptLiteralForString:html]];
+    NSString *scriptSource = [NSString stringWithFormat:@"tell application \"Notes\"\nwith timeout of 120 seconds\nmake new note at folder \"Notes\" of default account with properties {body:%@}\nend timeout\nend tell", [self appleScriptLiteralForString:html]];
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:scriptSource];
     NSDictionary *errorInfo = nil;
     [script executeAndReturnError:&errorInfo];
-    if (!errorInfo) return YES;
+    if (!errorInfo || [self appleScriptErrorLooksLikeCompletedSave:errorInfo]) return YES;
 
     NSInteger errorNumber = [errorInfo[NSAppleScriptErrorNumber] integerValue];
     if (errorNumber != -1728 && errorNumber != -10004) {
@@ -439,13 +519,20 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         return NO;
     }
 
-    NSString *fallbackSource = [NSString stringWithFormat:@"tell application \"Notes\"\nmake new note with properties {body:%@}\nend tell", [self appleScriptLiteralForString:html]];
+    NSString *fallbackSource = [NSString stringWithFormat:@"tell application \"Notes\"\nwith timeout of 120 seconds\nmake new note with properties {body:%@}\nend timeout\nend tell", [self appleScriptLiteralForString:html]];
     NSAppleScript *fallbackScript = [[NSAppleScript alloc] initWithSource:fallbackSource];
     NSDictionary *fallbackErrorInfo = nil;
     [fallbackScript executeAndReturnError:&fallbackErrorInfo];
-    if (!fallbackErrorInfo) return YES;
+    if (!fallbackErrorInfo || [self appleScriptErrorLooksLikeCompletedSave:fallbackErrorInfo]) return YES;
     if (outError) *outError = [self errorFromAppleScriptErrorInfo:fallbackErrorInfo fallback:@"Apple Notes could not create the note."];
     return NO;
+}
+
+- (BOOL)appleScriptErrorLooksLikeCompletedSave:(NSDictionary *)errorInfo {
+    NSInteger errorNumber = [errorInfo[NSAppleScriptErrorNumber] integerValue];
+    if (errorNumber == -1712) return YES;
+    NSString *message = [errorInfo[NSAppleScriptErrorMessage] lowercaseString] ?: @"";
+    return [message containsString:@"user canceled"] || [message containsString:@"handler failed"];
 }
 
 - (NSError *)errorFromAppleScriptErrorInfo:(NSDictionary *)errorInfo fallback:(NSString *)fallback {
