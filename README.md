@@ -48,7 +48,7 @@ The repo also includes a GitHub Actions workflow in [release.yml](/Users/han.han
 
 ## Use
 
-1. Open `Notie.app`.
+1. Open `build/Notie.app` after building locally, or open the packaged release app if you downloaded one from GitHub Releases.
 2. Click the `✎` menu bar icon and choose **Choose Markdown File…**.
 3. Press `⌘K` or click the `✎` menu bar icon and choose **New Note**.
 4. Type your note, paste a screenshot, or drag an image into the note window.
