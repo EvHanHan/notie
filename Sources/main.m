@@ -107,7 +107,6 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSPopUpButton *destinationPopUp;
 @property NSMenuItem *markdownTargetMenuItem;
 @property NSView *bottomBar;
-@property NSTextField *pasteLogLabel;
 @property NSMutableArray<NSDictionary *> *pendingImages;
 @property NSMapTable<NSTextAttachment *, NSString *> *attachmentImageIDs;
 @property EventHotKeyRef hotKeyRef;
@@ -152,7 +151,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)buildWindow {
-    NSRect frame = NSMakeRect(0, 0, 500, 206);
+    NSRect frame = NSMakeRect(0, 0, 500, 168);
     self.window = [[NSWindow alloc] initWithContentRect:frame styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable) backing:NSBackingStoreBuffered defer:NO];
     self.window.title = @"Notie";
     self.window.level = NSFloatingWindowLevel;
@@ -174,7 +173,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     divider.boxType = NSBoxSeparator;
     [content addSubview:divider];
 
-    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 81, frame.size.width, frame.size.height - 81)];
+    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 53, frame.size.width, frame.size.height - 53)];
     scrollView.borderType = NSNoBorder;
     scrollView.drawsBackground = YES;
     scrollView.backgroundColor = NSColor.textBackgroundColor;
@@ -206,15 +205,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     scrollView.documentView = self.textView;
     [content addSubview:scrollView];
 
-    self.pasteLogLabel = [NSTextField labelWithString:@"Paste log: ready"];
-    self.pasteLogLabel.frame = NSMakeRect(12, 57, frame.size.width - 24, 18);
-    self.pasteLogLabel.autoresizingMask = NSViewWidthSizable;
-    self.pasteLogLabel.font = [NSFont systemFontOfSize:11];
-    self.pasteLogLabel.textColor = NSColor.secondaryLabelColor;
-    self.pasteLogLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    self.pasteLogLabel.toolTip = @"Shows what Notie saw during the latest paste or drop.";
-    [content addSubview:self.pasteLogLabel];
-
     self.destinationPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(12, 10, 146, 32) pullsDown:NO];
     [self.destinationPopUp addItemWithTitle:@"Write to File"];
     [self.destinationPopUp addItemWithTitle:@"Apple Notes"];
@@ -245,7 +235,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [self positionCaptureWindowBottomRight];
     [self.window makeKeyAndOrderFront:nil];
     self.textView.string = @"";
-    self.pasteLogLabel.stringValue = @"Paste log: ready";
     [self.pendingImages removeAllObjects];
     [self.attachmentImageIDs removeAllObjects];
     [self updateTargetControls];
@@ -271,23 +260,19 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
 - (BOOL)addPendingImagesFromPasteboard:(NSPasteboard *)pasteboard {
     NSArray<NSURL *> *urls = [pasteboard readObjectsForClasses:@[NSURL.class] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-    [self updatePasteLogWithFormat:@"Paste seen: types=%@, file URLs=%lu", [pasteboard.types componentsJoinedByString:@", "], (unsigned long)urls.count];
     NSUInteger addedCount = 0;
     for (NSURL *url in urls) {
         if (![NotieImageFileExtensions() containsObject:url.pathExtension.lowercaseString]) {
-            [self updatePasteLogWithFormat:@"Skipped file: %@ is not a supported image", url.lastPathComponent ?: url.path];
             continue;
         }
         NSImage *image = [[NSImage alloc] initWithContentsOfURL:url];
         if (!image) {
-            [self updatePasteLogWithFormat:@"Could not read image file: %@", url.lastPathComponent ?: url.path];
             continue;
         }
         NSString *imageID = NSUUID.UUID.UUIDString;
         NSString *name = url.lastPathComponent ?: @"image";
         [self.pendingImages addObject:@{@"url": url, @"name": name, @"id": imageID}];
         [self insertImagePreview:image name:name imageID:imageID];
-        [self updatePasteLogWithFormat:@"Added image file: %@", name];
         addedCount++;
     }
 
@@ -298,13 +283,11 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
             NSString *imageID = NSUUID.UUID.UUIDString;
             [self.pendingImages addObject:@{@"image": image, @"name": name, @"id": imageID}];
             [self insertImagePreview:image name:name imageID:imageID];
-            [self updatePasteLogWithFormat:@"Added clipboard image: %@ (%@)", name, NSStringFromSize(image.size)];
             addedCount++;
         }
     }
 
     if (addedCount == 0) {
-        [self updatePasteLogWithFormat:@"No image found in paste. Types: %@", [pasteboard.types componentsJoinedByString:@", "]];
         return NO;
     }
     [self updateTargetControls];
@@ -315,7 +298,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (NSImage *)imageFromPasteboard:(NSPasteboard *)pasteboard {
     NSImage *image = [[NSImage alloc] initWithPasteboard:pasteboard];
     if (image) {
-        [self updatePasteLogWithFormat:@"Decoded image with NSImage pasteboard reader: %@", NSStringFromSize(image.size)];
         return image;
     }
 
@@ -325,23 +307,11 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
             if (data.length == 0) continue;
             image = [[NSImage alloc] initWithData:data];
             if (image) {
-                [self updatePasteLogWithFormat:@"Decoded image data as %@: %@ bytes", type, @(data.length)];
                 return image;
             }
         }
     }
     return nil;
-}
-
-- (void)updatePasteLogWithFormat:(NSString *)format, ... {
-    va_list args;
-    va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    NSString *line = [NSString stringWithFormat:@"Paste log: %@", message ?: @"ready"];
-    self.pasteLogLabel.stringValue = line;
-    self.pasteLogLabel.toolTip = line;
-    NSLog(@"[Notie] %@", message);
 }
 
 - (void)insertImagePreview:(NSImage *)image name:(NSString *)name imageID:(NSString *)imageID {
