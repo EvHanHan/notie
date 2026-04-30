@@ -531,23 +531,35 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
 - (BOOL)createAppleNoteWithBody:(NSString *)body images:(NSArray<NSDictionary *> *)images error:(NSError **)outError {
     NSString *title = [self appleNoteTitleForBody:body images:images];
-    NSString *html = [self appleNoteHTMLForBody:body images:images];
-    NSString *scriptSource = [NSString stringWithFormat:@"tell application \"Notes\"\nwith timeout of 120 seconds\nmake new note at folder \"Notes\" of default account with properties {body:%@}\nend timeout\nend tell", [self appleScriptLiteralForString:html]];
+    NSString *html = [self appleNoteHTMLForBody:body];
+    NSError *attachmentError = nil;
+    NSArray<NSURL *> *attachmentURLs = [self appleNoteAttachmentURLsForImages:images error:&attachmentError];
+    if (!attachmentURLs && images.count > 0) {
+        if (outError) *outError = attachmentError;
+        return NO;
+    }
+
+    NSString *scriptSource = [self appleNoteScriptSourceWithTitle:title html:html attachmentURLs:attachmentURLs includeDefaultFolder:YES];
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:scriptSource];
     NSDictionary *errorInfo = nil;
     [script executeAndReturnError:&errorInfo];
-    if (!errorInfo || [self appleScriptErrorLooksLikeCompletedSave:errorInfo]) return YES;
+    if (!errorInfo || [self appleScriptErrorLooksLikeCompletedSave:errorInfo]) {
+        [self removeAppleNoteTemporaryAttachments:attachmentURLs];
+        return YES;
+    }
 
     NSInteger errorNumber = [errorInfo[NSAppleScriptErrorNumber] integerValue];
     if (errorNumber != -1728 && errorNumber != -10004) {
+        [self removeAppleNoteTemporaryAttachments:attachmentURLs];
         if (outError) *outError = [self errorFromAppleScriptErrorInfo:errorInfo fallback:@"Apple Notes could not create the note."];
         return NO;
     }
 
-    NSString *fallbackSource = [NSString stringWithFormat:@"tell application \"Notes\"\nwith timeout of 120 seconds\nmake new note with properties {body:%@}\nend timeout\nend tell", [self appleScriptLiteralForString:html]];
+    NSString *fallbackSource = [self appleNoteScriptSourceWithTitle:title html:html attachmentURLs:attachmentURLs includeDefaultFolder:NO];
     NSAppleScript *fallbackScript = [[NSAppleScript alloc] initWithSource:fallbackSource];
     NSDictionary *fallbackErrorInfo = nil;
     [fallbackScript executeAndReturnError:&fallbackErrorInfo];
+    [self removeAppleNoteTemporaryAttachments:attachmentURLs];
     if (!fallbackErrorInfo || [self appleScriptErrorLooksLikeCompletedSave:fallbackErrorInfo]) return YES;
     if (outError) *outError = [self errorFromAppleScriptErrorInfo:fallbackErrorInfo fallback:@"Apple Notes could not create the note."];
     return NO;
@@ -577,7 +589,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     return @"Notie note";
 }
 
-- (NSString *)appleNoteHTMLForBody:(NSString *)body images:(NSArray<NSDictionary *> *)images {
+- (NSString *)appleNoteHTMLForBody:(NSString *)body {
     NSMutableString *html = [NSMutableString stringWithString:@"<html><body>"];
     NSString *trimmedBody = [body stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (trimmedBody.length > 0) {
@@ -588,47 +600,59 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
             [html appendFormat:@"<p>%@</p>", [self htmlEscapedString:trimmedParagraph]];
         }
     }
-    for (NSDictionary *imageInfo in images) {
-        NSString *dataURL = [self appleNoteImageDataURLForImage:imageInfo];
-        NSString *name = [self htmlEscapedString:imageInfo[@"name"] ?: @"image"];
-        if (dataURL.length > 0) {
-            [html appendFormat:@"<p><img src=\"%@\" alt=\"%@\" style=\"max-width:640px;\"></p>", dataURL, name];
-        } else {
-            [html appendFormat:@"<p>Image: %@</p>", name];
-        }
-    }
     [html appendString:@"</body></html>"];
     return html;
 }
 
-- (NSString *)appleNoteImageDataURLForImage:(NSDictionary *)imageInfo {
-    NSData *imageData = nil;
-    NSString *mimeType = @"image/png";
-    NSURL *sourceURL = imageInfo[@"url"];
-    if (sourceURL) {
-        imageData = [NSData dataWithContentsOfURL:sourceURL];
-        mimeType = [self mimeTypeForImageExtension:sourceURL.pathExtension];
-    } else {
-        NSImage *image = imageInfo[@"image"];
-        CGImageRef cgImage = [image CGImageForProposedRect:NULL context:nil hints:nil];
-        if (cgImage) {
-            NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithCGImage:cgImage];
-            imageData = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+- (NSString *)appleNoteScriptSourceWithTitle:(NSString *)title html:(NSString *)html attachmentURLs:(NSArray<NSURL *> *)attachmentURLs includeDefaultFolder:(BOOL)includeDefaultFolder {
+    NSMutableString *script = [NSMutableString stringWithString:@"tell application \"Notes\"\nwith timeout of 120 seconds\n"];
+    NSString *target = includeDefaultFolder ? @" at folder \"Notes\" of default account" : @"";
+    [script appendFormat:@"set createdNote to make new note%@ with properties {name:%@, body:%@}\n", target, [self appleScriptLiteralForString:title], [self appleScriptLiteralForString:html]];
+    if (attachmentURLs.count > 0) {
+        [script appendString:@"tell createdNote\n"];
+        for (NSURL *attachmentURL in attachmentURLs) {
+            [script appendFormat:@"make new attachment at end of attachments with data (POSIX file %@)\n", [self appleScriptLiteralForString:attachmentURL.path ?: @""]];
         }
+        [script appendString:@"end tell\n"];
     }
-    if (imageData.length == 0) return nil;
-    return [NSString stringWithFormat:@"data:%@;base64,%@", mimeType, [imageData base64EncodedStringWithOptions:0]];
+    [script appendString:@"end timeout\nend tell"];
+    return script;
 }
 
-- (NSString *)mimeTypeForImageExtension:(NSString *)extension {
-    NSString *lowercaseExtension = extension.lowercaseString;
-    if ([lowercaseExtension isEqualToString:@"jpg"] || [lowercaseExtension isEqualToString:@"jpeg"]) return @"image/jpeg";
-    if ([lowercaseExtension isEqualToString:@"gif"]) return @"image/gif";
-    if ([lowercaseExtension isEqualToString:@"heic"]) return @"image/heic";
-    if ([lowercaseExtension isEqualToString:@"tif"] || [lowercaseExtension isEqualToString:@"tiff"]) return @"image/tiff";
-    if ([lowercaseExtension isEqualToString:@"bmp"]) return @"image/bmp";
-    if ([lowercaseExtension isEqualToString:@"webp"]) return @"image/webp";
-    return @"image/png";
+- (NSArray<NSURL *> *)appleNoteAttachmentURLsForImages:(NSArray<NSDictionary *> *)images error:(NSError **)outError {
+    if (images.count == 0) return @[];
+
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSString *directoryName = [NSString stringWithFormat:@"notie-notes-%@", NSUUID.UUID.UUIDString];
+    NSURL *directoryURL = [self appleNoteAttachmentStagingRootURL];
+    directoryURL = [directoryURL URLByAppendingPathComponent:directoryName isDirectory:YES];
+    if (![fileManager createDirectoryAtURL:directoryURL withIntermediateDirectories:YES attributes:nil error:outError]) {
+        return nil;
+    }
+
+    NSMutableArray<NSURL *> *attachmentURLs = [NSMutableArray arrayWithCapacity:images.count];
+    for (NSDictionary *imageInfo in images) {
+        NSURL *savedURL = [self savePendingImage:imageInfo toDirectory:directoryURL fileManager:fileManager error:outError];
+        if (!savedURL) {
+            [self removeAppleNoteTemporaryAttachments:attachmentURLs];
+            [fileManager removeItemAtURL:directoryURL error:nil];
+            return nil;
+        }
+        [attachmentURLs addObject:savedURL];
+    }
+    return attachmentURLs;
+}
+
+- (NSURL *)appleNoteAttachmentStagingRootURL {
+    NSArray<NSURL *> *urls = [NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask];
+    NSURL *cachesURL = urls.firstObject ?: [NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES];
+    return [[cachesURL URLByAppendingPathComponent:@"Notie" isDirectory:YES] URLByAppendingPathComponent:@"AppleNotesAttachments" isDirectory:YES];
+}
+
+- (void)removeAppleNoteTemporaryAttachments:(NSArray<NSURL *> *)attachmentURLs {
+    if (attachmentURLs.count == 0) return;
+    NSURL *directoryURL = attachmentURLs.firstObject.URLByDeletingLastPathComponent;
+    [NSFileManager.defaultManager removeItemAtURL:directoryURL error:nil];
 }
 
 - (NSString *)appleNotesDescription {
