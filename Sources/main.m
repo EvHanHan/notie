@@ -38,8 +38,22 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @implementation CaptureTextView
 - (void)keyDown:(NSEvent *)event {
     BOOL commandDown = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
+    BOOL commandOnly = (event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask) == NSEventModifierFlagCommand;
+    NSString *characters = event.charactersIgnoringModifiers.lowercaseString ?: @"";
     if (event.keyCode == 36 && commandDown) {
         if (self.commandReturnHandler) self.commandReturnHandler();
+        return;
+    }
+    if (commandOnly && [characters isEqualToString:@"x"]) {
+        [self cut:nil];
+        return;
+    }
+    if (commandOnly && [characters isEqualToString:@"c"]) {
+        [self copy:nil];
+        return;
+    }
+    if (commandOnly && [characters isEqualToString:@"a"]) {
+        [self selectAll:nil];
         return;
     }
     if (event.keyCode == 9 && commandDown) {
@@ -58,6 +72,11 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 
 - (void)paste:(id)sender {
     if (self.pasteboardImageHandler && self.pasteboardImageHandler(NSPasteboard.generalPasteboard)) return;
+    NSString *plainText = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
+    if (plainText.length > 0) {
+        [self insertText:plainText replacementRange:self.selectedRange];
+        return;
+    }
     [super paste:sender];
 }
 
@@ -125,6 +144,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     self.pendingImages = [NSMutableArray array];
     self.attachmentImageIDs = [NSMapTable weakToStrongObjectsMapTable];
+    [self buildMainMenu];
     [self buildStatusItem];
     [self buildWindow];
     [self registerHotKey];
@@ -133,6 +153,30 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (void)applicationWillTerminate:(NSNotification *)notification {
     if (_hotKeyRef) UnregisterEventHotKey(_hotKeyRef);
     if (_handlerRef) RemoveEventHandler(_handlerRef);
+}
+
+- (void)buildMainMenu {
+    NSMenu *mainMenu = [NSMenu new];
+
+    NSMenuItem *appMenuItem = [NSMenuItem new];
+    [mainMenu addItem:appMenuItem];
+    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Notie"];
+    appMenuItem.submenu = appMenu;
+    [appMenu addItem:[[NSMenuItem alloc] initWithTitle:@"Quit Notie" action:@selector(quit:) keyEquivalent:@"q"]];
+
+    NSMenuItem *editMenuItem = [NSMenuItem new];
+    [mainMenu addItem:editMenuItem];
+    NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    editMenuItem.submenu = editMenu;
+    [editMenu addItem:[[NSMenuItem alloc] initWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"]];
+    [editMenu addItem:[[NSMenuItem alloc] initWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"Z"]];
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItem:[[NSMenuItem alloc] initWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"]];
+    [editMenu addItem:[[NSMenuItem alloc] initWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"]];
+    [editMenu addItem:[[NSMenuItem alloc] initWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"]];
+    [editMenu addItem:[[NSMenuItem alloc] initWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"]];
+
+    NSApp.mainMenu = mainMenu;
 }
 
 - (void)buildStatusItem {
