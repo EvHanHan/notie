@@ -100,8 +100,7 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSWindow *window;
 @property CaptureTextView *textView;
 @property NSPopUpButton *destinationPopUp;
-@property ClickableTextField *targetLabel;
-@property NSButton *chooseButton;
+@property NSMenuItem *markdownTargetMenuItem;
 @property NSView *bottomBar;
 @property NSTextField *pasteLogLabel;
 @property NSMutableArray<NSDictionary *> *pendingImages;
@@ -140,7 +139,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSMenu *menu = [NSMenu new];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"New Note" action:@selector(showCaptureWindow:) keyEquivalent:@"k"]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Save Note" action:@selector(saveNote:) keyEquivalent:@"\r"]];
-    [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Choose Markdown File…" action:@selector(chooseMarkdownFile:) keyEquivalent:@"o"]];
+    self.markdownTargetMenuItem = [[NSMenuItem alloc] initWithTitle:@"Default Target File: None" action:@selector(chooseMarkdownFile:) keyEquivalent:@"o"];
+    [menu addItem:self.markdownTargetMenuItem];
     [menu addItem:[NSMenuItem separatorItem]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Quit" action:@selector(quit:) keyEquivalent:@"q"]];
     self.statusItem.menu = menu;
@@ -218,17 +218,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.destinationPopUp.action = @selector(destinationChanged:);
     [self.bottomBar addSubview:self.destinationPopUp];
 
-    self.chooseButton = [NSButton buttonWithTitle:@"Choose File…" target:self action:@selector(chooseMarkdownFile:)];
-    self.chooseButton.frame = NSMakeRect(166, 10, 112, 32);
-    [self.bottomBar addSubview:self.chooseButton];
-
-    self.targetLabel = [ClickableTextField labelWithString:[self targetDescription]];
-    self.targetLabel.textColor = NSColor.secondaryLabelColor;
-    self.targetLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    self.targetLabel.toolTip = @"Click to choose a Markdown file";
-    self.targetLabel.clickHandler = ^{ [weakSelf chooseMarkdownFile:nil]; };
-    [self.bottomBar addSubview:self.targetLabel];
-
     NSButton *saveButton = [NSButton buttonWithTitle:@"Save  ⌘ ↩" target:self action:@selector(saveNote:)];
     saveButton.keyEquivalent = @"\r";
     saveButton.frame = NSMakeRect(328, 10, 160, 32);
@@ -253,7 +242,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.pasteLogLabel.stringValue = @"Paste log: ready";
     [self.pendingImages removeAllObjects];
     [self.attachmentImageIDs removeAllObjects];
-    self.targetLabel.stringValue = [self targetDescription];
     [self updateTargetControls];
     [self.window makeFirstResponder:self.textView];
 }
@@ -313,7 +301,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         [self updatePasteLogWithFormat:@"No image found in paste. Types: %@", [pasteboard.types componentsJoinedByString:@", "]];
         return NO;
     }
-    self.targetLabel.stringValue = [self targetDescription];
     [self updateTargetControls];
     [self refocusCaptureWindow];
     return YES;
@@ -421,7 +408,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults setObject:bookmark forKey:MarkdownFileBookmarkKey];
     [defaults setObject:fileURL.path forKey:MarkdownFilePathKey];
-    self.targetLabel.stringValue = [self targetDescription];
     [self updateTargetControls];
 }
 
@@ -482,7 +468,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)textDidChange:(NSNotification *)notification {
-    self.targetLabel.stringValue = [self targetDescription];
     [self updateTargetControls];
 }
 
@@ -496,16 +481,12 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
 - (void)updateTargetControls {
     NSString *path = [NSUserDefaults.standardUserDefaults stringForKey:MarkdownFilePathKey];
-    BOOL hasMarkdownFile = path.length > 0;
     NSString *destination = [self selectedSaveDestination];
     BOOL savesToAppleNotes = [destination isEqualToString:SaveDestinationAppleNotes];
     [self.destinationPopUp selectItemWithTitle:(savesToAppleNotes ? @"Apple Notes" : @"Write to File")];
-    self.chooseButton.hidden = YES;
-    self.targetLabel.stringValue = savesToAppleNotes ? [self appleNotesDescription] : [self targetDescription];
-    self.targetLabel.toolTip = savesToAppleNotes ? @"Creates a new note in Apple Notes" : (hasMarkdownFile ? @"Click to choose a different Markdown file" : @"Click to choose a Markdown file");
-    __weak AppDelegate *weakSelf = self;
-    self.targetLabel.clickHandler = savesToAppleNotes ? nil : ^{ [weakSelf chooseMarkdownFile:nil]; };
-    self.targetLabel.frame = NSMakeRect(166, 16, 150, 20);
+    NSString *targetTitle = path.length > 0 ? [NSString stringWithFormat:@"Default Target File: %@", path.lastPathComponent] : @"Default Target File: None";
+    self.markdownTargetMenuItem.title = targetTitle;
+    self.markdownTargetMenuItem.toolTip = path.length > 0 ? path : @"Click to choose the default Markdown file.";
 }
 
 - (NSString *)selectedSaveDestination {
