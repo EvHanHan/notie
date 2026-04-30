@@ -532,6 +532,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (BOOL)createAppleNoteWithBody:(NSString *)body images:(NSArray<NSDictionary *> *)images error:(NSError **)outError {
     NSString *title = [self appleNoteTitleForBody:body images:images];
     NSString *html = [self appleNoteHTMLForBody:body];
+    BOOL hasBodyText = [[body stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] length] > 0;
+    NSString *scriptTitle = hasBodyText ? nil : title;
     NSError *attachmentError = nil;
     NSArray<NSURL *> *attachmentURLs = [self appleNoteAttachmentURLsForImages:images error:&attachmentError];
     if (!attachmentURLs && images.count > 0) {
@@ -539,7 +541,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         return NO;
     }
 
-    NSString *scriptSource = [self appleNoteScriptSourceWithTitle:title html:html attachmentURLs:attachmentURLs includeDefaultFolder:YES];
+    NSString *scriptSource = [self appleNoteScriptSourceWithTitle:scriptTitle html:html attachmentURLs:attachmentURLs includeDefaultFolder:YES];
     NSAppleScript *script = [[NSAppleScript alloc] initWithSource:scriptSource];
     NSDictionary *errorInfo = nil;
     [script executeAndReturnError:&errorInfo];
@@ -555,7 +557,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         return NO;
     }
 
-    NSString *fallbackSource = [self appleNoteScriptSourceWithTitle:title html:html attachmentURLs:attachmentURLs includeDefaultFolder:NO];
+    NSString *fallbackSource = [self appleNoteScriptSourceWithTitle:scriptTitle html:html attachmentURLs:attachmentURLs includeDefaultFolder:NO];
     NSAppleScript *fallbackScript = [[NSAppleScript alloc] initWithSource:fallbackSource];
     NSDictionary *fallbackErrorInfo = nil;
     [fallbackScript executeAndReturnError:&fallbackErrorInfo];
@@ -607,7 +609,11 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (NSString *)appleNoteScriptSourceWithTitle:(NSString *)title html:(NSString *)html attachmentURLs:(NSArray<NSURL *> *)attachmentURLs includeDefaultFolder:(BOOL)includeDefaultFolder {
     NSMutableString *script = [NSMutableString stringWithString:@"tell application \"Notes\"\nwith timeout of 120 seconds\n"];
     NSString *target = includeDefaultFolder ? @" at folder \"Notes\" of default account" : @"";
-    [script appendFormat:@"set createdNote to make new note%@ with properties {name:%@, body:%@}\n", target, [self appleScriptLiteralForString:title], [self appleScriptLiteralForString:html]];
+    if (title.length > 0) {
+        [script appendFormat:@"set createdNote to make new note%@ with properties {name:%@, body:%@}\n", target, [self appleScriptLiteralForString:title], [self appleScriptLiteralForString:html]];
+    } else {
+        [script appendFormat:@"set createdNote to make new note%@ with properties {body:%@}\n", target, [self appleScriptLiteralForString:html]];
+    }
     if (attachmentURLs.count > 0) {
         [script appendString:@"tell createdNote\n"];
         for (NSURL *attachmentURL in attachmentURLs) {
