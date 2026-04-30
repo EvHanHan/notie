@@ -153,7 +153,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.window.level = NSFloatingWindowLevel;
     self.window.releasedWhenClosed = NO;
     self.window.backgroundColor = NSColor.windowBackgroundColor;
-    [self.window center];
+    [self positionCaptureWindowBottomRight];
 
     NSView *content = [[NSView alloc] initWithFrame:frame];
     content.wantsLayer = YES;
@@ -247,7 +247,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
 - (void)showCaptureWindow:(id)sender {
     [NSApp activateIgnoringOtherApps:YES];
-    [self.window center];
+    [self positionCaptureWindowBottomRight];
     [self.window makeKeyAndOrderFront:nil];
     self.textView.string = @"";
     self.pasteLogLabel.stringValue = @"Paste log: ready";
@@ -256,6 +256,16 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.targetLabel.stringValue = [self targetDescription];
     [self updateTargetControls];
     [self.window makeFirstResponder:self.textView];
+}
+
+- (void)positionCaptureWindowBottomRight {
+    NSScreen *screen = self.window.screen ?: NSScreen.mainScreen;
+    NSRect visibleFrame = screen.visibleFrame;
+    NSRect frame = self.window.frame;
+    CGFloat margin = 24.0;
+    frame.origin.x = NSMaxX(visibleFrame) - frame.size.width - margin;
+    frame.origin.y = NSMinY(visibleFrame) + margin;
+    [self.window setFrame:frame display:YES];
 }
 
 - (void)destinationChanged:(id)sender {
