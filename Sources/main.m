@@ -31,6 +31,7 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @interface CaptureTextView : NSTextView
 @property (nonatomic, copy) void (^commandReturnHandler)(void);
 @property (nonatomic, copy) void (^escapeHandler)(void);
+@property (nonatomic, copy) void (^chooseMarkdownFileHandler)(void);
 @property (nonatomic, copy) BOOL (^pasteboardImageHandler)(NSPasteboard *pasteboard);
 @end
 
@@ -43,6 +44,10 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
     }
     if (event.keyCode == 9 && commandDown) {
         if (self.pasteboardImageHandler && self.pasteboardImageHandler(NSPasteboard.generalPasteboard)) return;
+    }
+    if (event.keyCode == 31 && commandDown) {
+        if (self.chooseMarkdownFileHandler) self.chooseMarkdownFileHandler();
+        return;
     }
     if (event.keyCode == 53) {
         if (self.escapeHandler) self.escapeHandler();
@@ -195,6 +200,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     __weak AppDelegate *weakSelf = self;
     self.textView.commandReturnHandler = ^{ [weakSelf saveNote:nil]; };
     self.textView.escapeHandler = ^{ [weakSelf.window close]; };
+    self.textView.chooseMarkdownFileHandler = ^{ [weakSelf chooseMarkdownFile:nil]; };
     self.textView.pasteboardImageHandler = ^BOOL(NSPasteboard *pasteboard) { return [weakSelf addPendingImagesFromPasteboard:pasteboard]; };
     [self.textView registerForDraggedTypes:@[NSPasteboardTypeFileURL, NSPasteboardTypePNG, NSPasteboardTypeTIFF]];
     scrollView.documentView = self.textView;
@@ -393,6 +399,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         panel.directoryURL = currentURL;
         panel.nameFieldStringValue = currentURL.lastPathComponent ?: @"";
     }
+    [self positionPanelNearMenuBarWhenShown:panel];
 
     NSInteger response = [panel runModal];
     if (response != NSModalResponseOK) return;
@@ -409,6 +416,19 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [defaults setObject:bookmark forKey:MarkdownFileBookmarkKey];
     [defaults setObject:fileURL.path forKey:MarkdownFilePathKey];
     [self updateTargetControls];
+}
+
+- (void)positionPanelNearMenuBarWhenShown:(NSPanel *)panel {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSScreen *screen = NSScreen.mainScreen;
+        NSRect visibleFrame = screen.visibleFrame;
+        NSRect panelFrame = panel.frame;
+        CGFloat margin = 24.0;
+        CGFloat statusItemCenterX = NSMidX(self.statusItem.button.window.frame);
+        panelFrame.origin.x = MIN(MAX(NSMinX(visibleFrame) + margin, statusItemCenterX - (panelFrame.size.width / 2.0)), NSMaxX(visibleFrame) - panelFrame.size.width - margin);
+        panelFrame.origin.y = NSMaxY(visibleFrame) - panelFrame.size.height - margin;
+        [panel setFrame:panelFrame display:YES animate:NO];
+    });
 }
 
 - (void)saveNote:(id)sender {
