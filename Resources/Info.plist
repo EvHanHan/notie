@@ -8,6 +8,8 @@
 	<string>Notie</string>
 	<key>CFBundleExecutable</key>
 	<string>Notie</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.notie</string>
 	<key>CFBundleInfoDictionaryVersion</key>
