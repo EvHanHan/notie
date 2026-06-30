@@ -181,8 +181,25 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
 - (void)buildStatusItem {
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    self.statusItem.button.title = @"✎";
-    self.statusItem.button.toolTip = @"Notie";
+    NSStatusBarButton *button = self.statusItem.button;
+    button.toolTip = @"Notie";
+    button.title = @"";
+    button.imagePosition = NSImageOnly;
+
+    NSImage *menuBarImage = [NSImage imageNamed:@"MenuBarDuckTemplate"];
+    if (!menuBarImage) {
+        NSString *menuBarIconPath = [NSBundle.mainBundle pathForResource:@"MenuBarDuckTemplate" ofType:@"png"];
+        if (menuBarIconPath.length > 0) {
+            menuBarImage = [[NSImage alloc] initWithContentsOfFile:menuBarIconPath];
+        }
+    }
+    if (menuBarImage) {
+        menuBarImage.template = YES;
+        menuBarImage.size = NSMakeSize(18.0, 18.0);
+        button.image = menuBarImage;
+    } else {
+        button.title = @"✎";
+    }
 
     NSMenu *menu = [NSMenu new];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"New Note" action:@selector(showCaptureWindow:) keyEquivalent:@"k"]];

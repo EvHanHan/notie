@@ -10,6 +10,7 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 INFO_PLIST_SOURCE="$ROOT_DIR/Resources/Info.plist"
 ICON_SOURCE="$ROOT_DIR/Resources/AppIcon.icns"
+MENU_BAR_ICON_SOURCE="$ROOT_DIR/Resources/MenuBarDuckTemplate.png"
 MODULE_CACHE_DIR="${TMPDIR:-/tmp}/notie-clang-module-cache"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-}"
 
@@ -22,6 +23,7 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$MODULE_CACHE_DIR"
 cp "$INFO_PLIST_SOURCE" "$CONTENTS_DIR/Info.plist"
 cp "$ICON_SOURCE" "$RESOURCES_DIR/AppIcon.icns"
+cp "$MENU_BAR_ICON_SOURCE" "$RESOURCES_DIR/MenuBarDuckTemplate.png"
 
 env CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR" \
   clang \
