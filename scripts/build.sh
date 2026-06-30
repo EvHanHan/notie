@@ -34,20 +34,29 @@ env CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR" \
   -arch x86_64 \
   -framework Cocoa \
   -framework Carbon \
+  -framework EventKit \
   "$ROOT_DIR/Sources/main.m" \
   -o "$MACOS_DIR/$APP_NAME"
 
-if [[ -n "$SIGNING_IDENTITY" ]]; then
-  if ! command -v codesign >/dev/null 2>&1; then
-    echo "codesign is required when SIGNING_IDENTITY is set." >&2
-    exit 1
-  fi
+if ! command -v codesign >/dev/null 2>&1; then
+  echo "codesign is required to sign the app bundle." >&2
+  exit 1
+fi
 
+if [[ -n "$SIGNING_IDENTITY" ]]; then
   codesign \
     --force \
+    --deep \
     --sign "$SIGNING_IDENTITY" \
     --options runtime \
     --timestamp \
+    "$APP_BUNDLE" >/dev/null
+else
+  # Local builds still need a stable bundle signature so macOS can persist permissions.
+  codesign \
+    --force \
+    --deep \
+    --sign - \
     "$APP_BUNDLE" >/dev/null
 fi
 

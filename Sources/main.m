@@ -1,11 +1,13 @@
 #import <Cocoa/Cocoa.h>
 #import <Carbon/Carbon.h>
+#import <EventKit/EventKit.h>
 
 static NSString * const MarkdownFileBookmarkKey = @"MarkdownFileBookmark";
 static NSString * const MarkdownFilePathKey = @"MarkdownFilePath";
 static NSString * const SaveDestinationKey = @"SaveDestination";
 static NSString * const SaveDestinationMarkdown = @"markdown";
 static NSString * const SaveDestinationAppleNotes = @"appleNotes";
+static NSString * const SaveDestinationAppleReminders = @"appleReminders";
 static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
 
 static NSSet<NSString *> *NotieImageFileExtensions(void) {
@@ -128,6 +130,7 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSView *bottomBar;
 @property NSMutableArray<NSDictionary *> *pendingImages;
 @property NSMapTable<NSTextAttachment *, NSString *> *attachmentImageIDs;
+@property EKEventStore *eventStore;
 @property EventHotKeyRef hotKeyRef;
 @property EventHandlerRef handlerRef;
 - (void)showCaptureWindow:(id)sender;
@@ -144,6 +147,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     self.pendingImages = [NSMutableArray array];
     self.attachmentImageIDs = [NSMapTable weakToStrongObjectsMapTable];
+    self.eventStore = [EKEventStore new];
     [self buildMainMenu];
     [self buildStatusItem];
     [self buildWindow];
@@ -266,11 +270,13 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     scrollView.documentView = self.textView;
     [content addSubview:scrollView];
 
-    self.destinationPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(12, 10, 146, 32) pullsDown:NO];
+    self.destinationPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(12, 10, 180, 32) pullsDown:NO];
     [self.destinationPopUp addItemWithTitle:@"Write to File"];
     [self.destinationPopUp addItemWithTitle:@"Apple Notes"];
+    [self.destinationPopUp addItemWithTitle:@"Apple Reminders"];
     [self.destinationPopUp itemAtIndex:0].representedObject = SaveDestinationMarkdown;
     [self.destinationPopUp itemAtIndex:1].representedObject = SaveDestinationAppleNotes;
+    [self.destinationPopUp itemAtIndex:2].representedObject = SaveDestinationAppleReminders;
     self.destinationPopUp.target = self;
     self.destinationPopUp.action = @selector(destinationChanged:);
     [self.bottomBar addSubview:self.destinationPopUp];
@@ -465,25 +471,45 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (void)saveNote:(id)sender {
     NSString *body = [[self plainBodyText] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     NSArray<NSDictionary *> *visibleImages = [self visiblePendingImages];
-    if (body.length == 0 && visibleImages.count == 0) {
+    NSString *destination = [self selectedSaveDestination];
+    NSString *reminderTitle = [self reminderTitleForBody:body];
+    if (([destination isEqualToString:SaveDestinationAppleReminders] && reminderTitle.length == 0) || (body.length == 0 && visibleImages.count == 0)) {
         NSBeep();
         return;
     }
 
+    if ([destination isEqualToString:SaveDestinationAppleReminders]) {
+        [self createAppleReminderWithTitle:reminderTitle completion:^(BOOL saved, NSError *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (saved) {
+                    [self completeSuccessfulSaveWithTitle:@"Saved to Apple Reminders" informativeText:reminderTitle];
+                } else {
+                    [self showErrorWithTitle:@"Couldn’t save to Apple Reminders" message:error.localizedDescription ?: @"Unknown error."];
+                }
+            });
+        }];
+        return;
+    }
+
     NSError *error = nil;
-    NSString *destination = [self selectedSaveDestination];
     BOOL saved = [destination isEqualToString:SaveDestinationAppleNotes] ? [self createAppleNoteWithBody:body images:visibleImages error:&error] : [self appendEntryWithBody:body images:visibleImages error:&error];
     if (saved) {
-        [self.window close];
-        [self.pendingImages removeAllObjects];
-        NSUserNotification *notification = [NSUserNotification new];
-        notification.title = [destination isEqualToString:SaveDestinationAppleNotes] ? @"Saved to Apple Notes" : @"Saved to Markdown";
-        notification.informativeText = [destination isEqualToString:SaveDestinationAppleNotes] ? [self appleNoteTitleForBody:body images:visibleImages] : [self targetDescription];
-        [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
+        NSString *notificationTitle = [destination isEqualToString:SaveDestinationAppleNotes] ? @"Saved to Apple Notes" : @"Saved to Markdown";
+        NSString *informativeText = [destination isEqualToString:SaveDestinationAppleNotes] ? [self appleNoteTitleForBody:body images:visibleImages] : [self targetDescription];
+        [self completeSuccessfulSaveWithTitle:notificationTitle informativeText:informativeText];
     } else {
         NSString *title = [destination isEqualToString:SaveDestinationAppleNotes] ? @"Couldn’t save to Apple Notes" : @"Couldn’t save to Markdown";
         [self showErrorWithTitle:title message:error.localizedDescription ?: @"Unknown error."];
     }
+}
+
+- (void)completeSuccessfulSaveWithTitle:(NSString *)title informativeText:(NSString *)informativeText {
+    [self.window close];
+    [self.pendingImages removeAllObjects];
+    NSUserNotification *notification = [NSUserNotification new];
+    notification.title = title;
+    notification.informativeText = informativeText;
+    [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
 }
 
 - (NSString *)plainBodyText {
@@ -533,8 +559,13 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (void)updateTargetControls {
     NSString *path = [NSUserDefaults.standardUserDefaults stringForKey:MarkdownFilePathKey];
     NSString *destination = [self selectedSaveDestination];
-    BOOL savesToAppleNotes = [destination isEqualToString:SaveDestinationAppleNotes];
-    [self.destinationPopUp selectItemWithTitle:(savesToAppleNotes ? @"Apple Notes" : @"Write to File")];
+    if ([destination isEqualToString:SaveDestinationAppleNotes]) {
+        [self.destinationPopUp selectItemWithTitle:@"Apple Notes"];
+    } else if ([destination isEqualToString:SaveDestinationAppleReminders]) {
+        [self.destinationPopUp selectItemWithTitle:@"Apple Reminders"];
+    } else {
+        [self.destinationPopUp selectItemWithTitle:@"Write to File"];
+    }
     NSString *targetTitle = path.length > 0 ? [NSString stringWithFormat:@"Default Target File: %@", path.lastPathComponent] : @"Default Target File: None";
     self.markdownTargetMenuItem.title = targetTitle;
     self.markdownTargetMenuItem.toolTip = path.length > 0 ? path : @"Click to choose the default Markdown file.";
@@ -543,7 +574,85 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (NSString *)selectedSaveDestination {
     NSString *destination = [NSUserDefaults.standardUserDefaults stringForKey:SaveDestinationKey];
     if ([destination isEqualToString:SaveDestinationAppleNotes]) return SaveDestinationAppleNotes;
+    if ([destination isEqualToString:SaveDestinationAppleReminders]) return SaveDestinationAppleReminders;
     return SaveDestinationMarkdown;
+}
+
+- (NSString *)reminderTitleForBody:(NSString *)body {
+    NSArray<NSString *> *parts = [body componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSMutableArray<NSString *> *cleanParts = [NSMutableArray array];
+    for (NSString *part in parts) {
+        if (part.length > 0) [cleanParts addObject:part];
+    }
+    return [cleanParts componentsJoinedByString:@" "];
+}
+
+- (void)refreshEventStore {
+    self.eventStore = [EKEventStore new];
+}
+
+- (void)createAppleReminderWithTitle:(NSString *)title completion:(void (^)(BOOL saved, NSError *error))completion {
+    if (!self.eventStore) [self refreshEventStore];
+
+    void (^saveReminder)(void) = ^{
+        [self refreshEventStore];
+        EKCalendar *calendar = [self.eventStore defaultCalendarForNewReminders];
+        if (!calendar) {
+            NSError *error = [NSError errorWithDomain:@"Notie" code:6 userInfo:@{NSLocalizedDescriptionKey: @"No default Reminders list is available."}];
+            completion(NO, error);
+            return;
+        }
+
+        EKReminder *reminder = [EKReminder reminderWithEventStore:self.eventStore];
+        reminder.title = title;
+        reminder.calendar = calendar;
+        NSError *error = nil;
+        BOOL saved = [self.eventStore saveReminder:reminder commit:YES error:&error];
+        completion(saved, error);
+    };
+
+    EKAuthorizationStatus status = [EKEventStore authorizationStatusForEntityType:EKEntityTypeReminder];
+    BOOL hasAccess = NO;
+    if (@available(macOS 14.0, *)) {
+        hasAccess = status == EKAuthorizationStatusFullAccess || status == EKAuthorizationStatusWriteOnly;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        hasAccess = status == EKAuthorizationStatusAuthorized;
+#pragma clang diagnostic pop
+    }
+
+    if (hasAccess) {
+        saveReminder();
+        return;
+    }
+
+    if (status == EKAuthorizationStatusDenied || status == EKAuthorizationStatusRestricted) {
+        NSError *error = [NSError errorWithDomain:@"Notie" code:7 userInfo:@{NSLocalizedDescriptionKey: @"Notie does not have permission to add reminders. Allow Reminders access in System Settings."}];
+        completion(NO, error);
+        return;
+    }
+
+    EKEventStoreRequestAccessCompletionHandler requestCompletion = ^(BOOL granted, NSError *error) {
+        if (!granted) {
+            NSError *permissionError = error ?: [NSError errorWithDomain:@"Notie" code:8 userInfo:@{NSLocalizedDescriptionKey: @"Notie does not have permission to add reminders. Allow Reminders access in System Settings."}];
+            completion(NO, permissionError);
+            return;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self refreshEventStore];
+            saveReminder();
+        });
+    };
+
+    if (@available(macOS 14.0, *)) {
+        [self.eventStore requestFullAccessToRemindersWithCompletion:requestCompletion];
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [self.eventStore requestAccessToEntityType:EKEntityTypeReminder completion:requestCompletion];
+#pragma clang diagnostic pop
+    }
 }
 
 - (BOOL)createAppleNoteWithBody:(NSString *)body images:(NSArray<NSDictionary *> *)images error:(NSError **)outError {

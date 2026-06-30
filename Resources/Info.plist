@@ -27,6 +27,8 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>Notie saves your typed ideas into a Markdown file.</string>
+	<string>Notie creates Apple Notes from your typed ideas.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>Notie creates reminders from your typed ideas.</string>
 </dict>
 </plist>
