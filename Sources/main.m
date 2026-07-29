@@ -1,6 +1,10 @@
 #import <Cocoa/Cocoa.h>
 #import <Carbon/Carbon.h>
 #import <EventKit/EventKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreAudio/CoreAudio.h>
+#import <CoreAudio/AudioHardwareTapping.h>
+#import <os/log.h>
 
 static NSString * const MarkdownFileBookmarkKey = @"MarkdownFileBookmark";
 static NSString * const MarkdownFilePathKey = @"MarkdownFilePath";
@@ -9,6 +13,155 @@ static NSString * const SaveDestinationMarkdown = @"markdown";
 static NSString * const SaveDestinationAppleNotes = @"appleNotes";
 static NSString * const SaveDestinationAppleReminders = @"appleReminders";
 static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
+
+static os_log_t NotieRecordingLog(void) {
+    static os_log_t log;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        log = os_log_create("local.notie", "recording");
+    });
+    return log;
+}
+
+static void NotieLogRecordingMessage(NSString *message) {
+    os_log_info(NotieRecordingLog(), "%{public}@", message ?: @"");
+}
+
+static void NotieLogRecordingError(NSString *message) {
+    os_log_error(NotieRecordingLog(), "%{public}@", message ?: @"");
+}
+
+@interface SystemAudioRecorder : NSObject
+@property (nonatomic, readonly) BOOL recording;
+- (BOOL)startWritingToURL:(NSURL *)url error:(NSError **)outError;
+- (void)stop;
+@end
+
+@implementation SystemAudioRecorder {
+    AudioObjectID _tapID;
+    AudioObjectID _aggregateID;
+    AudioDeviceIOProcID _ioProcID;
+    AVAudioFile *_file;
+    dispatch_queue_t _queue;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _tapID = kAudioObjectUnknown;
+        _aggregateID = kAudioObjectUnknown;
+        _queue = dispatch_queue_create("local.notie.system-audio-tap", DISPATCH_QUEUE_SERIAL);
+    }
+    return self;
+}
+
+- (BOOL)startWritingToURL:(NSURL *)url error:(NSError **)outError {
+    if (_recording) return YES;
+    CATapDescription *description = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]];
+    description.name = @"Notie system audio tap";
+    description.privateTap = YES;
+    description.muteBehavior = CATapUnmuted;
+
+    OSStatus status = AudioHardwareCreateProcessTap(description, &_tapID);
+    if (status != noErr) {
+        if (outError) *outError = [self errorWithCode:status message:[NSString stringWithFormat:@"Could not create system audio tap (OSStatus %d). Allow Notie under Screen & System Audio Recording.", (int)status]];
+        NotieLogRecordingError([NSString stringWithFormat:@"Core Audio process tap creation failed: %d", (int)status]);
+        return NO;
+    }
+
+    AVAudioFormat *format = [self tapFormatWithError:outError];
+    if (!format) { [self cleanup]; return NO; }
+    NSDictionary *aggregateDescription = @{
+        @kAudioAggregateDeviceNameKey: @"Notie system audio",
+        @kAudioAggregateDeviceUIDKey: NSUUID.UUID.UUIDString,
+        @kAudioAggregateDeviceIsPrivateKey: @YES,
+        @kAudioAggregateDeviceIsStackedKey: @NO,
+        @kAudioAggregateDeviceTapAutoStartKey: @YES,
+        @kAudioAggregateDeviceSubDeviceListKey: @[],
+        @kAudioAggregateDeviceTapListKey: @[@{
+            @kAudioSubTapUIDKey: description.UUID.UUIDString,
+            @kAudioSubTapDriftCompensationKey: @YES
+        }]
+    };
+    status = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)aggregateDescription, &_aggregateID);
+    if (status != noErr) {
+        if (outError) *outError = [self errorWithCode:status message:[NSString stringWithFormat:@"Could not create system audio aggregate device (OSStatus %d).", (int)status]];
+        NotieLogRecordingError([NSString stringWithFormat:@"Core Audio aggregate device creation failed: %d", (int)status]);
+        [self cleanup];
+        return NO;
+    }
+
+    NSDictionary *settings = @{AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @(format.sampleRate), AVNumberOfChannelsKey: @(format.channelCount)};
+    NSError *fileError = nil;
+    _file = [[AVAudioFile alloc] initForWriting:url settings:settings commonFormat:format.commonFormat interleaved:format.isInterleaved error:&fileError];
+    if (!_file) {
+        if (outError) *outError = fileError;
+        NotieLogRecordingError([NSString stringWithFormat:@"System audio file creation failed: %@", fileError.localizedDescription ?: @"unknown error"]);
+        [self cleanup];
+        return NO;
+    }
+
+    __weak SystemAudioRecorder *weakSelf = self;
+    status = AudioDeviceCreateIOProcIDWithBlock(&_ioProcID, _aggregateID, _queue, ^(const AudioTimeStamp *now, const AudioBufferList *inputData, const AudioTimeStamp *inputTime, AudioBufferList *outputData, const AudioTimeStamp *outputTime) {
+        SystemAudioRecorder *strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf->_file || !inputData) return;
+        AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format bufferListNoCopy:(AudioBufferList *)inputData deallocator:nil];
+        if (!buffer) return;
+        NSError *writeError = nil;
+        [strongSelf->_file writeFromBuffer:buffer error:&writeError];
+        if (writeError) NotieLogRecordingError([NSString stringWithFormat:@"System audio write failed: %@", writeError.localizedDescription ?: @"unknown error"]);
+    });
+    if (status != noErr) {
+        if (outError) *outError = [self errorWithCode:status message:[NSString stringWithFormat:@"Could not create system audio IO proc (OSStatus %d).", (int)status]];
+        NotieLogRecordingError([NSString stringWithFormat:@"Core Audio IO proc creation failed: %d", (int)status]);
+        [self cleanup];
+        return NO;
+    }
+    status = AudioDeviceStart(_aggregateID, _ioProcID);
+    if (status != noErr) {
+        if (outError) *outError = [self errorWithCode:status message:[NSString stringWithFormat:@"Could not start system audio device (OSStatus %d).", (int)status]];
+        NotieLogRecordingError([NSString stringWithFormat:@"Core Audio device start failed: %d", (int)status]);
+        [self cleanup];
+        return NO;
+    }
+    _recording = YES;
+    NotieLogRecordingMessage([NSString stringWithFormat:@"Core Audio system tap started with format %@.", format]);
+    return YES;
+}
+
+- (AVAudioFormat *)tapFormatWithError:(NSError **)outError {
+    AudioObjectPropertyAddress address = {kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    AudioStreamBasicDescription asbd = {0};
+    UInt32 size = sizeof(asbd);
+    OSStatus status = AudioObjectGetPropertyData(_tapID, &address, 0, NULL, &size, &asbd);
+    AVAudioFormat *format = status == noErr ? [[AVAudioFormat alloc] initWithStreamDescription:&asbd] : nil;
+    if (!format && outError) *outError = [self errorWithCode:status message:[NSString stringWithFormat:@"Could not read system audio format (OSStatus %d).", (int)status]];
+    if (!format) NotieLogRecordingError([NSString stringWithFormat:@"Core Audio tap format read failed: %d", (int)status]);
+    return format;
+}
+
+- (NSError *)errorWithCode:(OSStatus)code message:(NSString *)message {
+    return [NSError errorWithDomain:@"Notie.CoreAudio" code:code userInfo:@{NSLocalizedDescriptionKey: message ?: @"Core Audio recording failed."}];
+}
+
+- (void)stop {
+    if (!_recording && _tapID == kAudioObjectUnknown) return;
+    _recording = NO;
+    if (_ioProcID && _aggregateID != kAudioObjectUnknown) AudioDeviceStop(_aggregateID, _ioProcID);
+    [self cleanup];
+    NotieLogRecordingMessage(@"Core Audio system tap stopped and cleaned up.");
+}
+
+- (void)cleanup {
+    if (_ioProcID && _aggregateID != kAudioObjectUnknown) AudioDeviceDestroyIOProcID(_aggregateID, _ioProcID);
+    _ioProcID = NULL;
+    if (_aggregateID != kAudioObjectUnknown) AudioHardwareDestroyAggregateDevice(_aggregateID);
+    _aggregateID = kAudioObjectUnknown;
+    if (_tapID != kAudioObjectUnknown) AudioHardwareDestroyProcessTap(_tapID);
+    _tapID = kAudioObjectUnknown;
+    _file = nil;
+}
+@end
 
 static NSSet<NSString *> *NotieImageFileExtensions(void) {
     static NSSet<NSString *> *extensions;
@@ -133,6 +286,15 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property EKEventStore *eventStore;
 @property EventHotKeyRef hotKeyRef;
 @property EventHandlerRef handlerRef;
+@property NSMenuItem *recordMenuItem;
+@property AVAudioEngine *audioEngine;
+@property AVAudioMixerNode *microphoneMixer;
+@property SystemAudioRecorder *systemAudioRecorder;
+@property AVAudioFile *microphoneFile;
+@property NSURL *recordingOutputURL;
+@property NSURL *recordingMarkdownURL;
+@property BOOL recording;
+@property dispatch_queue_t recordingQueue;
 - (void)showCaptureWindow:(id)sender;
 @end
 
@@ -148,6 +310,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.pendingImages = [NSMutableArray array];
     self.attachmentImageIDs = [NSMapTable weakToStrongObjectsMapTable];
     self.eventStore = [EKEventStore new];
+    self.recordingQueue = dispatch_queue_create("local.notie.recording", DISPATCH_QUEUE_SERIAL);
     [self buildMainMenu];
     [self buildStatusItem];
     [self buildWindow];
@@ -208,11 +371,160 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSMenu *menu = [NSMenu new];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"New Note" action:@selector(showCaptureWindow:) keyEquivalent:@"k"]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Save Note" action:@selector(saveNote:) keyEquivalent:@"\r"]];
+    self.recordMenuItem = [[NSMenuItem alloc] initWithTitle:@"Record" action:@selector(toggleRecording:) keyEquivalent:@""];
+    self.recordMenuItem.target = self;
+    [menu addItem:self.recordMenuItem];
     self.markdownTargetMenuItem = [[NSMenuItem alloc] initWithTitle:@"Default Target File: None" action:@selector(chooseMarkdownFile:) keyEquivalent:@"o"];
     [menu addItem:self.markdownTargetMenuItem];
     [menu addItem:[NSMenuItem separatorItem]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Quit" action:@selector(quit:) keyEquivalent:@"q"]];
     self.statusItem.menu = menu;
+}
+
+- (void)toggleRecording:(id)sender {
+    if (self.recording) [self stopRecording];
+    else [self startRecording];
+}
+
+- (void)startRecording {
+    NotieLogRecordingMessage(@"Record requested from menu bar.");
+    NSError *error = nil;
+    NSURL *markdownURL = [self markdownFileURLWithError:&error];
+    if (!markdownURL) {
+        NotieLogRecordingError([NSString stringWithFormat:@"No Markdown destination: %@", error.localizedDescription ?: @"unknown error"]);
+        [self showErrorWithTitle:@"Choose a Markdown file first" message:error.localizedDescription ?: @"Recordings are saved next to the Markdown destination."];
+        return;
+    }
+    NotieLogRecordingMessage([NSString stringWithFormat:@"Markdown destination: %@", markdownURL.path ?: @"unknown"]);
+
+    AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+    NotieLogRecordingMessage([NSString stringWithFormat:@"Microphone authorization status: %ld", (long)status]);
+    if (status == AVAuthorizationStatusDenied || status == AVAuthorizationStatusRestricted) {
+        NotieLogRecordingError(@"Microphone permission is denied or restricted.");
+        [self showErrorWithTitle:@"Microphone access is unavailable" message:@"Allow Notie to use the microphone in System Settings > Privacy & Security > Microphone."];
+        return;
+    }
+    void (^continueStarting)(void) = ^{
+        dispatch_async(dispatch_get_main_queue(), ^{ [self prepareRecordingWithMarkdownURL:markdownURL]; });
+    };
+    if (status == AVAuthorizationStatusNotDetermined) {
+        [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
+            if (granted) continueStarting();
+            else dispatch_async(dispatch_get_main_queue(), ^{
+                NotieLogRecordingError(@"Microphone permission request was denied.");
+                [self showErrorWithTitle:@"Microphone access is required" message:@"Allow Notie to use the microphone to record conversations."];
+            });
+        }];
+    } else {
+        continueStarting();
+    }
+}
+
+- (void)prepareRecordingWithMarkdownURL:(NSURL *)markdownURL {
+    if (self.recording) return;
+    NotieLogRecordingMessage(@"Preparing recording output and audio engine.");
+    [markdownURL startAccessingSecurityScopedResource];
+    self.recordingMarkdownURL = markdownURL;
+
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSURL *directory = [[markdownURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"recordings" isDirectory:YES];
+    NSError *error = nil;
+    if (![fileManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:&error]) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Could not create recordings directory %@: %@", directory.path ?: @"unknown", error.localizedDescription ?: @"unknown error"]);
+        [markdownURL stopAccessingSecurityScopedResource];
+        [self showErrorWithTitle:@"Couldn’t create recordings folder" message:error.localizedDescription ?: @"Notie could not create the recordings folder."];
+        return;
+    }
+
+    NSString *sessionName = [NSString stringWithFormat:@"recording-%@", [self timestampString]];
+    NSURL *sessionDirectory = [self uniqueURLInDirectory:directory preferredFilename:sessionName fileManager:fileManager];
+    if (![fileManager createDirectoryAtURL:sessionDirectory withIntermediateDirectories:YES attributes:nil error:&error]) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Could not create recording session directory: %@", error.localizedDescription ?: @"unknown error"]);
+        [markdownURL stopAccessingSecurityScopedResource];
+        [self showErrorWithTitle:@"Couldn’t start recording" message:error.localizedDescription ?: @"Notie could not create the recording folder."];
+        return;
+    }
+    NSURL *systemURL = [sessionDirectory URLByAppendingPathComponent:@"system.caf"];
+    NSURL *microphoneURL = [sessionDirectory URLByAppendingPathComponent:@"mic.caf"];
+    NotieLogRecordingMessage([NSString stringWithFormat:@"Recording session directory: %@", sessionDirectory.path ?: @"unknown"]);
+
+    self.systemAudioRecorder = [SystemAudioRecorder new];
+    if (![self.systemAudioRecorder startWritingToURL:systemURL error:&error]) {
+        [fileManager removeItemAtURL:sessionDirectory error:nil];
+        [markdownURL stopAccessingSecurityScopedResource];
+        [self showErrorWithTitle:@"Couldn’t start system audio recording" message:error.localizedDescription ?: @"Allow Notie under Screen & System Audio Recording and try again."];
+        return;
+    }
+
+    self.audioEngine = [AVAudioEngine new];
+    AVAudioInputNode *inputNode = self.audioEngine.inputNode;
+    AVAudioFormat *inputFormat = [inputNode outputFormatForBus:0];
+    NSDictionary *micSettings = @{AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @(inputFormat.sampleRate), AVNumberOfChannelsKey: @(inputFormat.channelCount)};
+    self.microphoneFile = [[AVAudioFile alloc] initForWriting:microphoneURL settings:micSettings error:&error];
+    if (!self.microphoneFile) {
+        [self.systemAudioRecorder stop];
+        [fileManager removeItemAtURL:sessionDirectory error:nil];
+        [markdownURL stopAccessingSecurityScopedResource];
+        [self showErrorWithTitle:@"Couldn’t start microphone recording" message:error.localizedDescription ?: @"Notie could not create the microphone audio file."];
+        return;
+    }
+    [inputNode installTapOnBus:0 bufferSize:4096 format:inputFormat block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
+        NSError *writeError = nil;
+        [self.microphoneFile writeFromBuffer:buffer error:&writeError];
+        if (writeError) NotieLogRecordingError([NSString stringWithFormat:@"Microphone audio write failed: %@", writeError.localizedDescription ?: @"unknown error"]);
+    }];
+    NSError *engineError = nil;
+    if (![self.audioEngine startAndReturnError:&engineError]) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Microphone audio engine failed to start: %@", engineError.localizedDescription ?: @"unknown error"]);
+        [inputNode removeTapOnBus:0];
+        [self.systemAudioRecorder stop];
+        self.microphoneFile = nil;
+        self.audioEngine = nil;
+        [fileManager removeItemAtURL:sessionDirectory error:nil];
+        [markdownURL stopAccessingSecurityScopedResource];
+        [self showErrorWithTitle:@"Couldn’t start microphone recording" message:engineError.localizedDescription ?: @"Notie could not start the microphone."];
+        return;
+    }
+
+    self.recordingOutputURL = sessionDirectory;
+    self.recording = YES;
+    self.recordMenuItem.title = @"Stop Recording";
+    self.statusItem.button.toolTip = @"Recording audio…";
+    NotieLogRecordingMessage(@"Microphone and Core Audio system recording started successfully.");
+}
+
+- (void)stopRecording {
+    [self stopRecordingWithError:nil];
+}
+
+- (void)stopRecordingWithError:(NSError *)failure {
+    if (!self.recording && !self.systemAudioRecorder) return;
+    NSURL *outputURL = self.recordingOutputURL;
+    NSURL *markdownURL = self.recordingMarkdownURL;
+    self.recording = NO;
+    if (failure) NotieLogRecordingError([NSString stringWithFormat:@"Stopping recording because of error: %@", failure.localizedDescription ?: @"unknown error"]);
+    else NotieLogRecordingMessage(@"Stopping microphone and Core Audio system recording normally.");
+    self.recordMenuItem.title = @"Record";
+    self.statusItem.button.toolTip = @"Notie";
+    [self.systemAudioRecorder stop];
+    self.systemAudioRecorder = nil;
+    [self.audioEngine stop];
+    [self.audioEngine.inputNode removeTapOnBus:0];
+    self.audioEngine = nil;
+    self.microphoneFile = nil;
+    self.recordingOutputURL = nil;
+    self.recordingMarkdownURL = nil;
+    [markdownURL stopAccessingSecurityScopedResource];
+    if (failure) {
+        [NSFileManager.defaultManager removeItemAtURL:outputURL error:nil];
+        [self showErrorWithTitle:@"Recording stopped" message:failure.localizedDescription ?: @"Notie could not capture system audio. Check Screen & System Audio Recording permission in System Settings."];
+        return;
+    }
+    NotieLogRecordingMessage([NSString stringWithFormat:@"Recording saved successfully: %@", outputURL.path ?: @"unknown"]);
+    NSUserNotification *notification = [NSUserNotification new];
+    notification.title = @"Recording saved";
+    notification.informativeText = outputURL.path ?: @"The audio files are ready.";
+    [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
 }
 
 - (void)buildWindow {

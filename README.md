@@ -79,3 +79,5 @@ Each saved note is appended to the selected file as a new Markdown bullet point.
 Images are copied into a sibling `*-assets` folder and linked from the bullet.
 Apple Notes entries are created through macOS automation and can include pasted or dragged images.
 Apple Reminders entries are created in your default Reminders list after you grant Reminders access; pasted or dragged images are ignored because reminder items do not support them.
+
+Choose **Record** from the menu bar dropdown to capture system audio and microphone audio together. Choose **Stop Recording** when finished; Notie saves a timestamped session folder containing `mic.caf` and `system.caf` in a `recordings` folder next to the selected Markdown file. macOS may ask for Microphone and System Audio Recording permission the first time. Recording requires macOS 14.2 or newer.

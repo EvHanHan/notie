@@ -29,12 +29,14 @@ env CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR" \
   clang \
   -fobjc-arc \
   -fmodules \
-  -mmacosx-version-min=12.0 \
+  -mmacosx-version-min=14.2 \
   -arch arm64 \
   -arch x86_64 \
   -framework Cocoa \
   -framework Carbon \
   -framework EventKit \
+  -framework AVFoundation \
+  -framework CoreAudio \
   "$ROOT_DIR/Sources/main.m" \
   -o "$MACOS_DIR/$APP_NAME"
 

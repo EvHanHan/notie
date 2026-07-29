@@ -23,12 +23,16 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>12.0</string>
+	<string>14.2</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Notie creates Apple Notes from your typed ideas.</string>
 	<key>NSRemindersUsageDescription</key>
 	<string>Notie creates reminders from your typed ideas.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Notie records microphone audio together with your Mac’s system audio.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Notie records system audio from calls and other apps when you choose Record.</string>
 </dict>
 </plist>
