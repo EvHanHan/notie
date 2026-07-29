@@ -33,6 +33,7 @@ static void NotieLogRecordingError(NSString *message) {
 
 @interface SystemAudioRecorder : NSObject
 @property (nonatomic, readonly) BOOL recording;
+@property (nonatomic, readonly) NSDate *firstBufferDate;
 - (BOOL)startWritingToURL:(NSURL *)url error:(NSError **)outError;
 - (void)stop;
 @end
@@ -43,6 +44,7 @@ static void NotieLogRecordingError(NSString *message) {
     AudioDeviceIOProcID _ioProcID;
     AVAudioFile *_file;
     dispatch_queue_t _queue;
+    NSDate *_firstBufferDate;
 }
 
 - (instancetype)init {
@@ -105,6 +107,7 @@ static void NotieLogRecordingError(NSString *message) {
     status = AudioDeviceCreateIOProcIDWithBlock(&_ioProcID, _aggregateID, _queue, ^(const AudioTimeStamp *now, const AudioBufferList *inputData, const AudioTimeStamp *inputTime, AudioBufferList *outputData, const AudioTimeStamp *outputTime) {
         SystemAudioRecorder *strongSelf = weakSelf;
         if (!strongSelf || !strongSelf->_file || !inputData) return;
+        if (!strongSelf->_firstBufferDate) strongSelf->_firstBufferDate = NSDate.date;
         AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format bufferListNoCopy:(AudioBufferList *)inputData deallocator:nil];
         if (!buffer) return;
         NSError *writeError = nil;
@@ -291,6 +294,8 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property AVAudioMixerNode *microphoneMixer;
 @property SystemAudioRecorder *systemAudioRecorder;
 @property AVAudioFile *microphoneFile;
+@property NSDate *microphoneFirstBufferDate;
+@property NSDate *recordingStartedAt;
 @property NSURL *recordingOutputURL;
 @property NSURL *recordingMarkdownURL;
 @property BOOL recording;
@@ -469,6 +474,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         return;
     }
     [inputNode installTapOnBus:0 bufferSize:4096 format:inputFormat block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
+        if (!self.microphoneFirstBufferDate) self.microphoneFirstBufferDate = NSDate.date;
         NSError *writeError = nil;
         [self.microphoneFile writeFromBuffer:buffer error:&writeError];
         if (writeError) NotieLogRecordingError([NSString stringWithFormat:@"Microphone audio write failed: %@", writeError.localizedDescription ?: @"unknown error"]);
@@ -487,10 +493,90 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     }
 
     self.recordingOutputURL = sessionDirectory;
+    self.microphoneFirstBufferDate = nil;
+    self.recordingStartedAt = NSDate.date;
     self.recording = YES;
     self.recordMenuItem.title = @"Stop Recording";
     self.statusItem.button.toolTip = @"Recording audio…";
     NotieLogRecordingMessage(@"Microphone and Core Audio system recording started successfully.");
+}
+
+- (AVAudioPCMBuffer *)convertedBufferFromFile:(AVAudioFile *)file toFormat:(AVAudioFormat *)targetFormat error:(NSError **)outError {
+    AVAudioFormat *sourceFormat = file.processingFormat;
+    AVAudioFrameCount sourceFrames = (AVAudioFrameCount)file.length;
+    AVAudioPCMBuffer *sourceBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:sourceFormat frameCapacity:sourceFrames];
+    if (!sourceBuffer || ![file readIntoBuffer:sourceBuffer error:outError]) return nil;
+    AVAudioFrameCount targetCapacity = (AVAudioFrameCount)ceil((double)sourceFrames * targetFormat.sampleRate / sourceFormat.sampleRate) + 1;
+    AVAudioPCMBuffer *targetBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:targetFormat frameCapacity:targetCapacity];
+    AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:sourceFormat toFormat:targetFormat];
+    if (!converter) {
+        if (outError) *outError = [NSError errorWithDomain:@"Notie" code:31 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not convert one recording track to the merged audio format."}];
+        return nil;
+    }
+    __block BOOL supplied = NO;
+    NSError *conversionError = nil;
+    AVAudioConverterOutputStatus status = [converter convertToBuffer:targetBuffer error:&conversionError withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus *outStatus) {
+        if (supplied) {
+            *outStatus = AVAudioConverterInputStatus_EndOfStream;
+            return nil;
+        }
+        supplied = YES;
+        *outStatus = AVAudioConverterInputStatus_HaveData;
+        return sourceBuffer;
+    }];
+    if (status == AVAudioConverterOutputStatus_Error || conversionError) {
+        if (outError) *outError = conversionError ?: [NSError errorWithDomain:@"Notie" code:32 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not convert one recording track."}];
+        return nil;
+    }
+    return targetBuffer;
+}
+
+- (BOOL)createMergedRecordingAtURL:(NSURL *)mergedURL microphoneURL:(NSURL *)microphoneURL systemURL:(NSURL *)systemURL microphoneStart:(NSDate *)microphoneStart systemStart:(NSDate *)systemStart error:(NSError **)outError {
+    NSError *error = nil;
+    AVAudioFile *microphoneFile = [[AVAudioFile alloc] initForReading:microphoneURL error:&error];
+    if (!microphoneFile) { if (outError) *outError = error; return NO; }
+    AVAudioFile *systemFile = [[AVAudioFile alloc] initForReading:systemURL error:&error];
+    if (!systemFile) { if (outError) *outError = error; return NO; }
+    double sampleRate = MAX(microphoneFile.processingFormat.sampleRate, systemFile.processingFormat.sampleRate);
+    AVAudioFormat *mixFormat = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:sampleRate channels:2];
+    AVAudioPCMBuffer *microphoneBuffer = [self convertedBufferFromFile:microphoneFile toFormat:mixFormat error:&error];
+    if (!microphoneBuffer) { if (outError) *outError = error; return NO; }
+    AVAudioPCMBuffer *systemBuffer = [self convertedBufferFromFile:systemFile toFormat:mixFormat error:&error];
+    if (!systemBuffer) { if (outError) *outError = error; return NO; }
+
+    NSDate *earliest = [microphoneStart earlierDate:systemStart] ?: NSDate.date;
+    AVAudioFramePosition microphoneOffset = (AVAudioFramePosition)MAX(0, round([microphoneStart timeIntervalSinceDate:earliest] * sampleRate));
+    AVAudioFramePosition systemOffset = (AVAudioFramePosition)MAX(0, round([systemStart timeIntervalSinceDate:earliest] * sampleRate));
+    AVAudioFramePosition totalFrames = MAX(microphoneOffset + microphoneBuffer.frameLength, systemOffset + systemBuffer.frameLength);
+    AVAudioPCMBuffer *mergedBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:mixFormat frameCapacity:(AVAudioFrameCount)totalFrames];
+    mergedBuffer.frameLength = (AVAudioFrameCount)totalFrames;
+    for (NSUInteger channel = 0; channel < 2; channel++) {
+        memset(mergedBuffer.floatChannelData[channel], 0, (size_t)totalFrames * sizeof(float));
+    }
+    AVAudioFrameCount microphoneChannels = microphoneBuffer.format.channelCount;
+    AVAudioFrameCount systemChannels = systemBuffer.format.channelCount;
+    for (AVAudioFramePosition frame = 0; frame < microphoneBuffer.frameLength; frame++) {
+        AVAudioFramePosition destination = microphoneOffset + frame;
+        for (NSUInteger channel = 0; channel < 2; channel++) {
+            NSUInteger sourceChannel = MIN(channel, microphoneChannels - 1);
+            mergedBuffer.floatChannelData[channel][destination] += microphoneBuffer.floatChannelData[sourceChannel][frame];
+        }
+    }
+    for (AVAudioFramePosition frame = 0; frame < systemBuffer.frameLength; frame++) {
+        AVAudioFramePosition destination = systemOffset + frame;
+        for (NSUInteger channel = 0; channel < 2; channel++) {
+            NSUInteger sourceChannel = MIN(channel, systemChannels - 1);
+            mergedBuffer.floatChannelData[channel][destination] += systemBuffer.floatChannelData[sourceChannel][frame];
+        }
+    }
+
+    NSDictionary *settings = @{AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @(sampleRate), AVNumberOfChannelsKey: @2};
+    AVAudioFile *outputFile = [[AVAudioFile alloc] initForWriting:mergedURL settings:settings commonFormat:mixFormat.commonFormat interleaved:mixFormat.isInterleaved error:&error];
+    if (!outputFile || ![outputFile writeFromBuffer:mergedBuffer error:&error]) {
+        if (outError) *outError = error ?: [NSError errorWithDomain:@"Notie" code:33 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not write the merged audio file."}];
+        return NO;
+    }
+    return YES;
 }
 
 - (void)stopRecording {
@@ -501,6 +587,10 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     if (!self.recording && !self.systemAudioRecorder) return;
     NSURL *outputURL = self.recordingOutputURL;
     NSURL *markdownURL = self.recordingMarkdownURL;
+    NSURL *microphoneURL = [outputURL URLByAppendingPathComponent:@"mic.caf"];
+    NSURL *systemURL = [outputURL URLByAppendingPathComponent:@"system.caf"];
+    NSDate *microphoneStart = self.microphoneFirstBufferDate ?: self.recordingStartedAt ?: NSDate.date;
+    NSDate *systemStart = self.systemAudioRecorder.firstBufferDate ?: self.recordingStartedAt ?: NSDate.date;
     self.recording = NO;
     if (failure) NotieLogRecordingError([NSString stringWithFormat:@"Stopping recording because of error: %@", failure.localizedDescription ?: @"unknown error"]);
     else NotieLogRecordingMessage(@"Stopping microphone and Core Audio system recording normally.");
@@ -512,8 +602,14 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [self.audioEngine.inputNode removeTapOnBus:0];
     self.audioEngine = nil;
     self.microphoneFile = nil;
+    NSError *mergeError = nil;
+    NSURL *mergedURL = [outputURL URLByAppendingPathComponent:@"merged.m4a"];
+    BOOL merged = !failure && [self createMergedRecordingAtURL:mergedURL microphoneURL:microphoneURL systemURL:systemURL microphoneStart:microphoneStart systemStart:systemStart error:&mergeError];
+    if (merged) NotieLogRecordingMessage([NSString stringWithFormat:@"Merged transcription file saved successfully: %@", mergedURL.path ?: @"unknown"]);
+    else if (!failure) NotieLogRecordingError([NSString stringWithFormat:@"Could not create merged transcription file: %@", mergeError.localizedDescription ?: @"unknown error"]);
     self.recordingOutputURL = nil;
     self.recordingMarkdownURL = nil;
+    self.recordingStartedAt = nil;
     [markdownURL stopAccessingSecurityScopedResource];
     if (failure) {
         [NSFileManager.defaultManager removeItemAtURL:outputURL error:nil];
@@ -523,7 +619,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NotieLogRecordingMessage([NSString stringWithFormat:@"Recording saved successfully: %@", outputURL.path ?: @"unknown"]);
     NSUserNotification *notification = [NSUserNotification new];
     notification.title = @"Recording saved";
-    notification.informativeText = outputURL.path ?: @"The audio files are ready.";
+    notification.informativeText = merged ? [NSString stringWithFormat:@"Merged audio: %@", mergedURL.path ?: @"ready"] : (outputURL.path ?: @"The audio files are ready.");
     [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
 }
 
