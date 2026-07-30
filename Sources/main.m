@@ -697,11 +697,9 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL {
-    // Helpers live beside the executable in Contents/Helpers, not under the
-    // bundle's Resources directory. `pathForResource:…inDirectory:` only
-    // searches Resources, so it cannot find this executable in a built app.
-    NSURL *helperURL = [[NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Contents" isDirectory:YES]
-                       URLByAppendingPathComponent:@"Helpers/notie-transcriber"];
+    // On macOS, mainBundle.bundleURL is the app's Contents directory. The
+    // helper is packaged beside Resources at Contents/Helpers.
+    NSURL *helperURL = [NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Helpers/notie-transcriber"];
     NSString *helperPath = helperURL.path;
     if (helperPath.length == 0 || ![[NSFileManager defaultManager] isExecutableFileAtPath:helperPath]) {
         NotieLogRecordingError([NSString stringWithFormat:@"Transcription helper is missing or not executable: %@", helperPath ?: @"unknown"]);
