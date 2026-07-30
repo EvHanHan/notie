@@ -341,9 +341,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [self buildStatusItem];
     [self buildWindow];
     [self registerHotKey];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self retryPendingTranscriptions];
-    });
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
@@ -405,6 +402,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [menu addItem:self.transcriptionProgressMenuItem];
     [self buildTranscriptionLogMenuItem];
     [menu addItem:self.transcriptionLogMenuItem];
+    [menu addItem:[NSMenuItem separatorItem]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"New Note" action:@selector(showCaptureWindow:) keyEquivalent:@"k"]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Save Note" action:@selector(saveNote:) keyEquivalent:@"\r"]];
     self.markdownTargetMenuItem = [[NSMenuItem alloc] initWithTitle:@"Default Target File: None" action:@selector(chooseMarkdownFile:) keyEquivalent:@"o"];
@@ -781,24 +779,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSURL *metadataURL = [sessionURL URLByAppendingPathComponent:@"meta.json"];
     if (![data writeToURL:metadataURL options:NSDataWritingAtomic error:outError]) return NO;
     return YES;
-}
-
-- (void)retryPendingTranscriptions {
-    NSError *error = nil;
-    NSURL *markdownURL = [self markdownFileURLWithError:&error];
-    if (!markdownURL) return;
-    NSURL *recordingsURL = [[markdownURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"recordings" isDirectory:YES];
-    NSArray<NSURL *> *sessions = [[NSFileManager defaultManager] contentsOfDirectoryAtURL:recordingsURL includingPropertiesForKeys:@[NSURLIsDirectoryKey] options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
-    for (NSURL *sessionURL in sessions) {
-        NSNumber *isDirectory = nil;
-        [sessionURL getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
-        if (!isDirectory.boolValue) continue;
-        NSURL *metaURL = [sessionURL URLByAppendingPathComponent:@"meta.json"];
-        NSURL *transcriptURL = [sessionURL URLByAppendingPathComponent:@"transcript.json"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:metaURL.path] && ![[NSFileManager defaultManager] fileExistsAtPath:transcriptURL.path]) {
-            [self startTranscriptionForSessionAtURL:sessionURL];
-        }
-    }
 }
 
 - (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL {
