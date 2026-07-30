@@ -8,6 +8,8 @@
 
 static NSString * const MarkdownFileBookmarkKey = @"MarkdownFileBookmark";
 static NSString * const MarkdownFilePathKey = @"MarkdownFilePath";
+static NSString * const RecordingsFolderBookmarkKey = @"RecordingsFolderBookmark";
+static NSString * const RecordingsFolderPathKey = @"RecordingsFolderPath";
 static NSString * const SaveDestinationKey = @"SaveDestination";
 static NSString * const SaveDestinationMarkdown = @"markdown";
 static NSString * const SaveDestinationAppleNotes = @"appleNotes";
@@ -291,6 +293,7 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property CaptureTextView *textView;
 @property NSPopUpButton *destinationPopUp;
 @property NSMenuItem *markdownTargetMenuItem;
+@property NSMenuItem *recordingsFolderMenuItem;
 @property NSView *bottomBar;
 @property NSMutableArray<NSDictionary *> *pendingImages;
 @property NSMapTable<NSTextAttachment *, NSString *> *attachmentImageIDs;
@@ -310,7 +313,7 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSDate *microphoneFirstBufferDate;
 @property NSDate *recordingStartedAt;
 @property NSURL *recordingOutputURL;
-@property NSURL *recordingMarkdownURL;
+@property NSURL *recordingFolderURL;
 @property BOOL recording;
 @property dispatch_queue_t recordingQueue;
 @property NSMutableSet<NSTask *> *activeTranscriptionTasks;
@@ -402,6 +405,9 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [menu addItem:self.transcriptionProgressMenuItem];
     [self buildTranscriptionLogMenuItem];
     [menu addItem:self.transcriptionLogMenuItem];
+    self.recordingsFolderMenuItem = [[NSMenuItem alloc] initWithTitle:@"Recordings Folder: None" action:@selector(chooseRecordingsFolder:) keyEquivalent:@""];
+    self.recordingsFolderMenuItem.target = self;
+    [menu addItem:self.recordingsFolderMenuItem];
     [menu addItem:[NSMenuItem separatorItem]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"New Note" action:@selector(showCaptureWindow:) keyEquivalent:@"k"]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Save Note" action:@selector(saveNote:) keyEquivalent:@"\r"]];
@@ -500,13 +506,13 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (void)startRecording {
     NotieLogRecordingMessage(@"Record requested from menu bar.");
     NSError *error = nil;
-    NSURL *markdownURL = [self markdownFileURLWithError:&error];
-    if (!markdownURL) {
-        NotieLogRecordingError([NSString stringWithFormat:@"No Markdown destination: %@", error.localizedDescription ?: @"unknown error"]);
-        [self showErrorWithTitle:@"Choose a Markdown file first" message:error.localizedDescription ?: @"Recordings are saved next to the Markdown destination."];
+    NSURL *recordingsFolderURL = [self recordingsFolderURLWithError:&error];
+    if (!recordingsFolderURL) {
+        NotieLogRecordingError([NSString stringWithFormat:@"No recordings folder: %@", error.localizedDescription ?: @"unknown error"]);
+        [self showErrorWithTitle:@"Choose a recordings folder first" message:error.localizedDescription ?: @"Select where Notie should save recordings."];
         return;
     }
-    NotieLogRecordingMessage([NSString stringWithFormat:@"Markdown destination: %@", markdownURL.path ?: @"unknown"]);
+    NotieLogRecordingMessage([NSString stringWithFormat:@"Recordings folder: %@", recordingsFolderURL.path ?: @"unknown"]);
 
     AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
     NotieLogRecordingMessage([NSString stringWithFormat:@"Microphone authorization status: %ld", (long)status]);
@@ -516,7 +522,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         return;
     }
     void (^continueStarting)(void) = ^{
-        dispatch_async(dispatch_get_main_queue(), ^{ [self prepareRecordingWithMarkdownURL:markdownURL]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self prepareRecordingWithFolderURL:recordingsFolderURL]; });
     };
     if (status == AVAuthorizationStatusNotDetermined) {
         [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
@@ -531,18 +537,23 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     }
 }
 
-- (void)prepareRecordingWithMarkdownURL:(NSURL *)markdownURL {
+- (void)prepareRecordingWithFolderURL:(NSURL *)recordingsFolderURL {
     if (self.recording) return;
     NotieLogRecordingMessage(@"Preparing recording output and audio engine.");
-    [markdownURL startAccessingSecurityScopedResource];
-    self.recordingMarkdownURL = markdownURL;
+    if (![recordingsFolderURL startAccessingSecurityScopedResource]) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Could not access recordings folder: %@", recordingsFolderURL.path ?: @"unknown"]);
+        [self showErrorWithTitle:@"Couldn’t access recordings folder" message:@"Select the recordings folder again and try recording."];
+        return;
+    }
+    self.recordingFolderURL = recordingsFolderURL;
 
     NSFileManager *fileManager = NSFileManager.defaultManager;
-    NSURL *directory = [[markdownURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"recordings" isDirectory:YES];
+    NSURL *directory = [recordingsFolderURL URLByAppendingPathComponent:@"recordings" isDirectory:YES];
     NSError *error = nil;
     if (![fileManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:&error]) {
         NotieLogRecordingError([NSString stringWithFormat:@"Could not create recordings directory %@: %@", directory.path ?: @"unknown", error.localizedDescription ?: @"unknown error"]);
-        [markdownURL stopAccessingSecurityScopedResource];
+        [recordingsFolderURL stopAccessingSecurityScopedResource];
+        self.recordingFolderURL = nil;
         [self showErrorWithTitle:@"Couldn’t create recordings folder" message:error.localizedDescription ?: @"Notie could not create the recordings folder."];
         return;
     }
@@ -551,7 +562,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSURL *sessionDirectory = [self uniqueURLInDirectory:directory preferredFilename:sessionName fileManager:fileManager];
     if (![fileManager createDirectoryAtURL:sessionDirectory withIntermediateDirectories:YES attributes:nil error:&error]) {
         NotieLogRecordingError([NSString stringWithFormat:@"Could not create recording session directory: %@", error.localizedDescription ?: @"unknown error"]);
-        [markdownURL stopAccessingSecurityScopedResource];
+        [recordingsFolderURL stopAccessingSecurityScopedResource];
+        self.recordingFolderURL = nil;
         [self showErrorWithTitle:@"Couldn’t start recording" message:error.localizedDescription ?: @"Notie could not create the recording folder."];
         return;
     }
@@ -562,7 +574,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.systemAudioRecorder = [SystemAudioRecorder new];
     if (![self.systemAudioRecorder startWritingToURL:systemURL error:&error]) {
         [fileManager removeItemAtURL:sessionDirectory error:nil];
-        [markdownURL stopAccessingSecurityScopedResource];
+        [recordingsFolderURL stopAccessingSecurityScopedResource];
+        self.recordingFolderURL = nil;
         [self showErrorWithTitle:@"Couldn’t start system audio recording" message:error.localizedDescription ?: @"Allow Notie under Screen & System Audio Recording and try again."];
         return;
     }
@@ -583,7 +596,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     if (!self.microphoneFile) {
         [self.systemAudioRecorder stop];
         [fileManager removeItemAtURL:sessionDirectory error:nil];
-        [markdownURL stopAccessingSecurityScopedResource];
+        [recordingsFolderURL stopAccessingSecurityScopedResource];
+        self.recordingFolderURL = nil;
         [self showErrorWithTitle:@"Couldn’t start microphone recording" message:error.localizedDescription ?: @"Notie could not create the microphone audio file."];
         return;
     }
@@ -601,7 +615,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         self.microphoneFile = nil;
         self.audioEngine = nil;
         [fileManager removeItemAtURL:sessionDirectory error:nil];
-        [markdownURL stopAccessingSecurityScopedResource];
+        [recordingsFolderURL stopAccessingSecurityScopedResource];
+        self.recordingFolderURL = nil;
         [self showErrorWithTitle:@"Couldn’t start microphone recording" message:engineError.localizedDescription ?: @"Notie could not start the microphone."];
         return;
     }
@@ -700,7 +715,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 - (void)stopRecordingWithError:(NSError *)failure {
     if (!self.recording && !self.systemAudioRecorder) return;
     NSURL *outputURL = self.recordingOutputURL;
-    NSURL *markdownURL = self.recordingMarkdownURL;
+    NSURL *recordingsFolderURL = self.recordingFolderURL;
     NSURL *microphoneURL = [outputURL URLByAppendingPathComponent:@"mic.wav"];
     NSURL *systemURL = [outputURL URLByAppendingPathComponent:@"system.wav"];
     NSDate *microphoneStart = self.microphoneFirstBufferDate ?: self.recordingStartedAt ?: NSDate.date;
@@ -729,9 +744,9 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Audio merge failed: %@", mergeError.localizedDescription ?: @"unknown error"]];
     }
     self.recordingOutputURL = nil;
-    self.recordingMarkdownURL = nil;
+    self.recordingFolderURL = nil;
     self.recordingStartedAt = nil;
-    [markdownURL stopAccessingSecurityScopedResource];
+    [recordingsFolderURL stopAccessingSecurityScopedResource];
     if (failure) {
         [NSFileManager.defaultManager removeItemAtURL:outputURL error:nil];
         [self appendTranscriptionLogMessage:@"Recording stopped because of an audio error."];
@@ -1103,6 +1118,36 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [self updateTargetControls];
 }
 
+- (void)chooseRecordingsFolder:(id)sender {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.title = @"Choose Recordings Folder";
+    panel.prompt = @"Use This Folder";
+    panel.canChooseFiles = NO;
+    panel.canChooseDirectories = YES;
+    panel.allowsMultipleSelection = NO;
+    panel.canCreateDirectories = YES;
+
+    NSURL *currentURL = [self currentRecordingsFolderURL];
+    if (currentURL) panel.directoryURL = currentURL;
+    [self positionPanelNearMenuBarWhenShown:panel];
+
+    NSInteger response = [panel runModal];
+    if (response != NSModalResponseOK) return;
+
+    NSURL *folderURL = panel.URL;
+    NSError *error = nil;
+    NSData *bookmark = [folderURL bookmarkDataWithOptions:NSURLBookmarkCreationWithSecurityScope includingResourceValuesForKeys:nil relativeToURL:nil error:&error];
+    if (!bookmark) {
+        [self showErrorWithTitle:@"Couldn’t save recordings folder" message:error.localizedDescription ?: @"The selected folder could not be remembered."];
+        return;
+    }
+
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setObject:bookmark forKey:RecordingsFolderBookmarkKey];
+    [defaults setObject:folderURL.path forKey:RecordingsFolderPathKey];
+    [self updateTargetControls];
+}
+
 - (void)positionPanelNearMenuBarWhenShown:(NSPanel *)panel {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSScreen *screen = NSScreen.mainScreen;
@@ -1206,6 +1251,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
 - (void)updateTargetControls {
     NSString *path = [NSUserDefaults.standardUserDefaults stringForKey:MarkdownFilePathKey];
+    NSString *recordingsFolderPath = [NSUserDefaults.standardUserDefaults stringForKey:RecordingsFolderPathKey];
     NSString *destination = [self selectedSaveDestination];
     if ([destination isEqualToString:SaveDestinationAppleNotes]) {
         [self.destinationPopUp selectItemWithTitle:@"Apple Notes"];
@@ -1217,6 +1263,9 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSString *targetTitle = path.length > 0 ? [NSString stringWithFormat:@"Default Target File: %@", path.lastPathComponent] : @"Default Target File: None";
     self.markdownTargetMenuItem.title = targetTitle;
     self.markdownTargetMenuItem.toolTip = path.length > 0 ? path : @"Click to choose the default Markdown file.";
+    NSString *recordingsFolderTitle = recordingsFolderPath.length > 0 ? [NSString stringWithFormat:@"Recordings Folder: %@", recordingsFolderPath.lastPathComponent] : @"Recordings Folder: None";
+    self.recordingsFolderMenuItem.title = recordingsFolderTitle;
+    self.recordingsFolderMenuItem.toolTip = recordingsFolderPath.length > 0 ? recordingsFolderPath : @"Click to choose where recordings are saved.";
 }
 
 - (NSString *)selectedSaveDestination {
@@ -1623,10 +1672,31 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     return nil;
 }
 
+- (NSURL *)recordingsFolderURLWithError:(NSError **)outError {
+    NSData *bookmark = [NSUserDefaults.standardUserDefaults objectForKey:RecordingsFolderBookmarkKey];
+    if (bookmark) {
+        BOOL stale = NO;
+        NSError *error = nil;
+        NSURL *url = [NSURL URLByResolvingBookmarkData:bookmark options:NSURLBookmarkResolutionWithSecurityScope relativeToURL:nil bookmarkDataIsStale:&stale error:&error];
+        if (url && !stale) return url;
+        if (outError) *outError = error ?: [NSError errorWithDomain:@"Notie" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Select the recordings folder again."}];
+        return nil;
+    }
+
+    if (outError) *outError = [NSError errorWithDomain:@"Notie" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Choose a recordings folder first."}];
+    return nil;
+}
+
 - (NSURL *)currentMarkdownFileURL {
     NSString *path = [NSUserDefaults.standardUserDefaults stringForKey:MarkdownFilePathKey];
     if (path.length == 0) return nil;
     return [NSURL fileURLWithPath:path];
+}
+
+- (NSURL *)currentRecordingsFolderURL {
+    NSString *path = [NSUserDefaults.standardUserDefaults stringForKey:RecordingsFolderPathKey];
+    if (path.length == 0) return nil;
+    return [NSURL fileURLWithPath:path isDirectory:YES];
 }
 
 - (NSString *)targetDescription {
