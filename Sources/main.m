@@ -298,6 +298,11 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property EventHotKeyRef hotKeyRef;
 @property EventHandlerRef handlerRef;
 @property NSMenuItem *recordMenuItem;
+@property NSMenuItem *transcriptionProgressMenuItem;
+@property NSTextField *transcriptionProgressLabel;
+@property NSProgressIndicator *transcriptionProgressIndicator;
+@property NSMenuItem *transcriptionLogMenuItem;
+@property NSMutableArray<NSString *> *transcriptionLogMessages;
 @property AVAudioEngine *audioEngine;
 @property AVAudioMixerNode *microphoneMixer;
 @property SystemAudioRecorder *systemAudioRecorder;
@@ -311,6 +316,10 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSMutableSet<NSTask *> *activeTranscriptionTasks;
 - (void)showCaptureWindow:(id)sender;
 - (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL;
+- (void)showTranscriptionProgressWithMessage:(NSString *)message;
+- (void)updateTranscriptionProgressForEvent:(NSString *)event message:(NSString *)message;
+- (void)finishTranscriptionProgressSuccessfully:(BOOL)succeeded;
+- (void)appendTranscriptionLogMessage:(NSString *)message;
 @end
 
 static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, void *userData) {
@@ -327,6 +336,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.eventStore = [EKEventStore new];
     self.recordingQueue = dispatch_queue_create("local.notie.recording", DISPATCH_QUEUE_SERIAL);
     self.activeTranscriptionTasks = [NSMutableSet set];
+    self.transcriptionLogMessages = [NSMutableArray array];
     [self buildMainMenu];
     [self buildStatusItem];
     [self buildWindow];
@@ -388,16 +398,100 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     }
 
     NSMenu *menu = [NSMenu new];
-    [menu addItem:[[NSMenuItem alloc] initWithTitle:@"New Note" action:@selector(showCaptureWindow:) keyEquivalent:@"k"]];
-    [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Save Note" action:@selector(saveNote:) keyEquivalent:@"\r"]];
     self.recordMenuItem = [[NSMenuItem alloc] initWithTitle:@"Record" action:@selector(toggleRecording:) keyEquivalent:@""];
     self.recordMenuItem.target = self;
     [menu addItem:self.recordMenuItem];
+    [self buildTranscriptionProgressMenuItem];
+    [menu addItem:self.transcriptionProgressMenuItem];
+    [self buildTranscriptionLogMenuItem];
+    [menu addItem:self.transcriptionLogMenuItem];
+    [menu addItem:[[NSMenuItem alloc] initWithTitle:@"New Note" action:@selector(showCaptureWindow:) keyEquivalent:@"k"]];
+    [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Save Note" action:@selector(saveNote:) keyEquivalent:@"\r"]];
     self.markdownTargetMenuItem = [[NSMenuItem alloc] initWithTitle:@"Default Target File: None" action:@selector(chooseMarkdownFile:) keyEquivalent:@"o"];
     [menu addItem:self.markdownTargetMenuItem];
     [menu addItem:[NSMenuItem separatorItem]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Quit" action:@selector(quit:) keyEquivalent:@"q"]];
     self.statusItem.menu = menu;
+}
+
+- (void)buildTranscriptionProgressMenuItem {
+    NSView *progressView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 260, 42)];
+
+    self.transcriptionProgressLabel = [NSTextField labelWithString:@"Preparing transcription…"];
+    self.transcriptionProgressLabel.frame = NSMakeRect(10, 21, 240, 17);
+    self.transcriptionProgressLabel.font = [NSFont systemFontOfSize:12.0];
+    self.transcriptionProgressLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [progressView addSubview:self.transcriptionProgressLabel];
+
+    self.transcriptionProgressIndicator = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(10, 8, 240, 10)];
+    self.transcriptionProgressIndicator.style = NSProgressIndicatorStyleBar;
+    self.transcriptionProgressIndicator.controlSize = NSControlSizeSmall;
+    self.transcriptionProgressIndicator.minValue = 0.0;
+    self.transcriptionProgressIndicator.maxValue = 100.0;
+    self.transcriptionProgressIndicator.indeterminate = YES;
+    [progressView addSubview:self.transcriptionProgressIndicator];
+
+    self.transcriptionProgressMenuItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    self.transcriptionProgressMenuItem.view = progressView;
+    self.transcriptionProgressMenuItem.hidden = YES;
+}
+
+- (void)buildTranscriptionLogMenuItem {
+    self.transcriptionLogMenuItem = [[NSMenuItem alloc] initWithTitle:@"Transcription log" action:nil keyEquivalent:@""];
+    self.transcriptionLogMenuItem.submenu = [[NSMenu alloc] initWithTitle:@"Transcription log"];
+    [self appendTranscriptionLogMessage:@"Waiting for the next transcription."];
+}
+
+- (void)appendTranscriptionLogMessage:(NSString *)message {
+    if (message.length == 0) return;
+    NSString *timestamp = [[NSDateFormatter localizedStringFromDate:NSDate.date dateStyle:NSDateFormatterNoStyle timeStyle:NSDateFormatterMediumStyle] stringByAppendingFormat:@"  %@", message];
+    if ([message hasPrefix:@"Downloading transcription model"] && self.transcriptionLogMessages.count > 0 && [self.transcriptionLogMessages.lastObject containsString:@"Downloading transcription model"]) {
+        self.transcriptionLogMessages[self.transcriptionLogMessages.count - 1] = timestamp;
+    } else {
+        [self.transcriptionLogMessages addObject:timestamp];
+    }
+    while (self.transcriptionLogMessages.count > 8) [self.transcriptionLogMessages removeObjectAtIndex:0];
+
+    NSMenu *logMenu = self.transcriptionLogMenuItem.submenu;
+    [logMenu removeAllItems];
+    for (NSString *entry in self.transcriptionLogMessages) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:entry action:nil keyEquivalent:@""];
+        item.enabled = NO;
+        [logMenu addItem:item];
+    }
+}
+
+- (void)showTranscriptionProgressWithMessage:(NSString *)message {
+    self.transcriptionProgressMenuItem.hidden = NO;
+    self.transcriptionProgressLabel.stringValue = message;
+    self.transcriptionProgressIndicator.indeterminate = YES;
+    [self.transcriptionProgressIndicator startAnimation:nil];
+    self.statusItem.button.toolTip = [NSString stringWithFormat:@"Transcribing: %@", message];
+}
+
+- (void)updateTranscriptionProgressForEvent:(NSString *)event message:(NSString *)message {
+    if ([event isEqualToString:@"progress"]) {
+        NSInteger percentage = MIN(MAX(message.integerValue, 0), 100);
+        self.transcriptionProgressMenuItem.hidden = NO;
+        self.transcriptionProgressLabel.stringValue = [NSString stringWithFormat:@"Downloading transcription model — %ld%%", (long)percentage];
+        self.transcriptionProgressIndicator.indeterminate = NO;
+        self.transcriptionProgressIndicator.doubleValue = percentage;
+        [self.transcriptionProgressIndicator stopAnimation:nil];
+        self.statusItem.button.toolTip = self.transcriptionProgressLabel.stringValue;
+        return;
+    }
+
+    [self showTranscriptionProgressWithMessage:message];
+}
+
+- (void)finishTranscriptionProgressSuccessfully:(BOOL)succeeded {
+    if (self.activeTranscriptionTasks.count != 0) return;
+    self.transcriptionProgressMenuItem.hidden = NO;
+    [self.transcriptionProgressIndicator stopAnimation:nil];
+    self.transcriptionProgressIndicator.indeterminate = NO;
+    self.transcriptionProgressIndicator.doubleValue = succeeded ? 100.0 : 0.0;
+    self.transcriptionProgressLabel.stringValue = succeeded ? @"Transcript ready" : @"Transcription failed — see transcribe.log";
+    self.statusItem.button.toolTip = self.transcriptionProgressLabel.stringValue;
 }
 
 - (void)toggleRecording:(id)sender {
@@ -618,7 +712,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     if (failure) NotieLogRecordingError([NSString stringWithFormat:@"Stopping recording because of error: %@", failure.localizedDescription ?: @"unknown error"]);
     else NotieLogRecordingMessage(@"Stopping microphone and Core Audio system recording normally.");
     self.recordMenuItem.title = @"Record";
-    self.statusItem.button.toolTip = @"Notie";
+    [self showTranscriptionProgressWithMessage:@"Preparing audio for transcription…"];
+    [self appendTranscriptionLogMessage:@"Stop pressed — preparing audio files."];
     [self.systemAudioRecorder stop];
     self.systemAudioRecorder = nil;
     [self.audioEngine stop];
@@ -628,14 +723,21 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSError *mergeError = nil;
     NSURL *mergedURL = [outputURL URLByAppendingPathComponent:@"merged.m4a"];
     BOOL merged = !failure && [self createMergedRecordingAtURL:mergedURL microphoneURL:microphoneURL systemURL:systemURL microphoneStart:microphoneStart systemStart:systemStart error:&mergeError];
-    if (merged) NotieLogRecordingMessage([NSString stringWithFormat:@"Merged transcription file saved successfully: %@", mergedURL.path ?: @"unknown"]);
-    else if (!failure) NotieLogRecordingError([NSString stringWithFormat:@"Could not create merged transcription file: %@", mergeError.localizedDescription ?: @"unknown error"]);
+    if (merged) {
+        NotieLogRecordingMessage([NSString stringWithFormat:@"Merged transcription file saved successfully: %@", mergedURL.path ?: @"unknown"]);
+        [self appendTranscriptionLogMessage:@"Audio files prepared."];
+    } else if (!failure) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Could not create merged transcription file: %@", mergeError.localizedDescription ?: @"unknown error"]);
+        [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Audio merge failed: %@", mergeError.localizedDescription ?: @"unknown error"]];
+    }
     self.recordingOutputURL = nil;
     self.recordingMarkdownURL = nil;
     self.recordingStartedAt = nil;
     [markdownURL stopAccessingSecurityScopedResource];
     if (failure) {
         [NSFileManager.defaultManager removeItemAtURL:outputURL error:nil];
+        [self appendTranscriptionLogMessage:@"Recording stopped because of an audio error."];
+        [self finishTranscriptionProgressSuccessfully:NO];
         [self showErrorWithTitle:@"Recording stopped" message:failure.localizedDescription ?: @"Notie could not capture system audio. Check Screen & System Audio Recording permission in System Settings."];
         return;
     }
@@ -648,8 +750,11 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSError *metadataError = nil;
     BOOL metadataWritten = [self writeSessionMetadataAtURL:outputURL recordingStart:recordingStart microphoneStart:microphoneStart systemStart:systemStart endedAt:NSDate.date error:&metadataError];
     if (!metadataWritten) {
+        [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Could not save transcription metadata: %@", metadataError.localizedDescription ?: @"unknown error"]];
+        [self finishTranscriptionProgressSuccessfully:NO];
         NotieLogRecordingError([NSString stringWithFormat:@"Could not write transcription metadata: %@", metadataError.localizedDescription ?: @"unknown error"]);
     } else {
+        [self appendTranscriptionLogMessage:@"Starting transcription helper."];
         [self startTranscriptionForSessionAtURL:outputURL];
     }
 }
@@ -697,11 +802,12 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL {
-    // On macOS, mainBundle.bundleURL is the app's Contents directory. The
-    // helper is packaged beside Resources at Contents/Helpers.
-    NSURL *helperURL = [NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Helpers/notie-transcriber"];
+    // bundleURL is the .app directory; the helper is packaged at Contents/Helpers.
+    NSURL *helperURL = [NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Contents/Helpers/notie-transcriber"];
     NSString *helperPath = helperURL.path;
     if (helperPath.length == 0 || ![[NSFileManager defaultManager] isExecutableFileAtPath:helperPath]) {
+        [self appendTranscriptionLogMessage:@"Transcription helper is missing or is not executable."];
+        [self finishTranscriptionProgressSuccessfully:NO];
         NotieLogRecordingError([NSString stringWithFormat:@"Transcription helper is missing or not executable: %@", helperPath ?: @"unknown"]);
         return;
     }
@@ -711,6 +817,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSPipe *pipe = [NSPipe pipe];
     task.standardOutput = pipe;
     task.standardError = pipe;
+    [self showTranscriptionProgressWithMessage:@"Preparing transcription…"];
     __weak AppDelegate *weakSelf = self;
     pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
         NSData *data = [handle availableData];
@@ -720,11 +827,13 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
             if (line.length == 0) continue;
             NSArray<NSString *> *parts = [line componentsSeparatedByString:@"\t"];
             if (parts.count < 2) continue;
+            NSString *event = parts[0];
             NSString *message = parts[1];
             dispatch_async(dispatch_get_main_queue(), ^{
                 AppDelegate *strongSelf = weakSelf;
                 if (strongSelf) {
-                    strongSelf.statusItem.button.toolTip = [NSString stringWithFormat:@"Transcribing: %@", message];
+                    [strongSelf updateTranscriptionProgressForEvent:event message:message];
+                    [strongSelf appendTranscriptionLogMessage:message];
                     NotieLogRecordingMessage([NSString stringWithFormat:@"Transcription: %@", message]);
                 }
             });
@@ -736,16 +845,18 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
             AppDelegate *strongSelf = weakSelf;
             if (!strongSelf) return;
             [strongSelf.activeTranscriptionTasks removeObject:finishedTask];
-            strongSelf.statusItem.button.toolTip = @"Notie";
+            [strongSelf finishTranscriptionProgressSuccessfully:(finishedTask.terminationStatus == 0)];
             NSUserNotification *result = [NSUserNotification new];
             if (finishedTask.terminationStatus == 0) {
                 result.title = @"Transcript ready";
                 result.informativeText = sessionURL.path ?: @"The transcript was saved next to the recording.";
                 NotieLogRecordingMessage([NSString stringWithFormat:@"Transcript saved successfully: %@", sessionURL.path ?: @"unknown"]);
+                [strongSelf appendTranscriptionLogMessage:@"Transcript saved successfully."];
             } else {
                 result.title = @"Transcription failed";
                 result.informativeText = @"The recording was preserved. Check transcribe.log in the recording folder.";
                 NotieLogRecordingError([NSString stringWithFormat:@"Transcription failed with status %d for %@", finishedTask.terminationStatus, sessionURL.path ?: @"unknown"]);
+                [strongSelf appendTranscriptionLogMessage:[NSString stringWithFormat:@"Helper exited with status %d.", finishedTask.terminationStatus]];
             }
             [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:result];
         });
@@ -758,11 +869,16 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         NSError *launchError = nil;
         if (![task launchAndReturnError:&launchError]) {
             [self.activeTranscriptionTasks removeObject:task];
+            [self finishTranscriptionProgressSuccessfully:NO];
+            [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Could not start helper: %@", launchError.localizedDescription ?: @"unknown error"]];
             NotieLogRecordingError([NSString stringWithFormat:@"Could not launch transcription helper: %@", launchError.localizedDescription ?: @"unknown error"]);
             return;
         }
         [self.activeTranscriptionTasks addObject:task];
+        [self appendTranscriptionLogMessage:@"Transcription helper started."];
     } @catch (NSException *exception) {
+        [self finishTranscriptionProgressSuccessfully:NO];
+        [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Could not start helper: %@", exception.reason ?: @"unknown error"]];
         NotieLogRecordingError([NSString stringWithFormat:@"Could not launch transcription helper: %@", exception.reason ?: @"unknown error"]);
     }
 }
