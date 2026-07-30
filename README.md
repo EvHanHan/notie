@@ -14,22 +14,26 @@ The easiest way to share Notie on GitHub is through Releases.
 
 ## Build From Source
 
-Notie builds with Apple Command Line Tools, so full Xcode is not required.
+Notie builds with Apple Command Line Tools and Rust, so full Xcode is not required. The Rust helper builds `transcribe-cpp` and its native C++ backend locally.
 
-1. Install the tools once with `xcode-select --install`.
-2. Build the app with:
+1. Install Apple Command Line Tools with `xcode-select --install`.
+2. Install CMake, for example with `brew install cmake`.
+3. Install Rust with [rustup](https://rustup.rs), then add both app targets with `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
+4. Build the app with:
 
 ```sh
 ./scripts/build.sh
 ```
 
-3. Launch the built app with:
+5. Launch the built app with:
 
 ```sh
 open build/Notie.app
 ```
 
 You can also double-click `open-notie.command`, which builds and launches the app for you.
+
+If a Rust build ends with `cmake-0.1.58` and `-mcpu=native`, update the repository and rerun `./scripts/build.sh`; the build script disables native CPU tuning so both Apple Silicon and Intel targets can be compiled.
 
 ## Package For GitHub
 
@@ -80,4 +84,6 @@ Images are copied into a sibling `*-assets` folder and linked from the bullet.
 Apple Notes entries are created through macOS automation and can include pasted or dragged images.
 Apple Reminders entries are created in your default Reminders list after you grant Reminders access; pasted or dragged images are ignored because reminder items do not support them.
 
-Choose **Record** from the menu bar dropdown to capture system audio and microphone audio together. Choose **Stop Recording** when finished; Notie saves a timestamped session folder containing `mic.caf` and `system.caf` in a `recordings` folder next to the selected Markdown file. macOS may ask for Microphone and System Audio Recording permission the first time. Recording requires macOS 14.2 or newer.
+Choose **Record** from the menu bar dropdown to capture system audio and microphone audio together. Choose **Stop Recording** when finished; Notie saves a timestamped session folder containing `mic.wav`, `system.wav`, `meta.json`, `transcript.json`, and `transcript.md` in a `recordings` folder next to the selected Markdown file. macOS may ask for Microphone and System Audio Recording permission the first time. Recording requires macOS 14.2 or newer.
+
+Transcription runs automatically and entirely on-device using `transcribe-cpp` with the English-only Parakeet TDT 0.6B v2 Q4_K_M model. The first transcription downloads approximately 475 MB and caches it under `~/Library/Application Support/Notie/Models`; later transcriptions reuse the cached model and can work offline. Mic and system audio are transcribed independently and rendered as `me` and `them` segments in chronological order. If transcription fails, the audio remains available and the error is appended to `transcribe.log`. Pending sessions are retried when Notie launches again.

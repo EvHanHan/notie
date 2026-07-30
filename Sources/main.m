@@ -93,7 +93,15 @@ static void NotieLogRecordingError(NSString *message) {
         return NO;
     }
 
-    NSDictionary *settings = @{AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @(format.sampleRate), AVNumberOfChannelsKey: @(format.channelCount)};
+    NSDictionary *settings = @{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVSampleRateKey: @(format.sampleRate),
+        AVNumberOfChannelsKey: @(format.channelCount),
+        AVLinearPCMBitDepthKey: @32,
+        AVLinearPCMIsFloatKey: @YES,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVLinearPCMIsNonInterleaved: @NO
+    };
     NSError *fileError = nil;
     _file = [[AVAudioFile alloc] initForWriting:url settings:settings commonFormat:format.commonFormat interleaved:format.isInterleaved error:&fileError];
     if (!_file) {
@@ -300,7 +308,9 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSURL *recordingMarkdownURL;
 @property BOOL recording;
 @property dispatch_queue_t recordingQueue;
+@property NSMutableSet<NSTask *> *activeTranscriptionTasks;
 - (void)showCaptureWindow:(id)sender;
+- (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL;
 @end
 
 static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, void *userData) {
@@ -316,10 +326,14 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.attachmentImageIDs = [NSMapTable weakToStrongObjectsMapTable];
     self.eventStore = [EKEventStore new];
     self.recordingQueue = dispatch_queue_create("local.notie.recording", DISPATCH_QUEUE_SERIAL);
+    self.activeTranscriptionTasks = [NSMutableSet set];
     [self buildMainMenu];
     [self buildStatusItem];
     [self buildWindow];
     [self registerHotKey];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self retryPendingTranscriptions];
+    });
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
@@ -449,8 +463,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         [self showErrorWithTitle:@"Couldn’t start recording" message:error.localizedDescription ?: @"Notie could not create the recording folder."];
         return;
     }
-    NSURL *systemURL = [sessionDirectory URLByAppendingPathComponent:@"system.caf"];
-    NSURL *microphoneURL = [sessionDirectory URLByAppendingPathComponent:@"mic.caf"];
+    NSURL *systemURL = [sessionDirectory URLByAppendingPathComponent:@"system.wav"];
+    NSURL *microphoneURL = [sessionDirectory URLByAppendingPathComponent:@"mic.wav"];
     NotieLogRecordingMessage([NSString stringWithFormat:@"Recording session directory: %@", sessionDirectory.path ?: @"unknown"]);
 
     self.systemAudioRecorder = [SystemAudioRecorder new];
@@ -464,7 +478,15 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.audioEngine = [AVAudioEngine new];
     AVAudioInputNode *inputNode = self.audioEngine.inputNode;
     AVAudioFormat *inputFormat = [inputNode outputFormatForBus:0];
-    NSDictionary *micSettings = @{AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @(inputFormat.sampleRate), AVNumberOfChannelsKey: @(inputFormat.channelCount)};
+    NSDictionary *micSettings = @{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVSampleRateKey: @(inputFormat.sampleRate),
+        AVNumberOfChannelsKey: @(inputFormat.channelCount),
+        AVLinearPCMBitDepthKey: @32,
+        AVLinearPCMIsFloatKey: @YES,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVLinearPCMIsNonInterleaved: @NO
+    };
     self.microphoneFile = [[AVAudioFile alloc] initForWriting:microphoneURL settings:micSettings error:&error];
     if (!self.microphoneFile) {
         [self.systemAudioRecorder stop];
@@ -587,10 +609,11 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     if (!self.recording && !self.systemAudioRecorder) return;
     NSURL *outputURL = self.recordingOutputURL;
     NSURL *markdownURL = self.recordingMarkdownURL;
-    NSURL *microphoneURL = [outputURL URLByAppendingPathComponent:@"mic.caf"];
-    NSURL *systemURL = [outputURL URLByAppendingPathComponent:@"system.caf"];
+    NSURL *microphoneURL = [outputURL URLByAppendingPathComponent:@"mic.wav"];
+    NSURL *systemURL = [outputURL URLByAppendingPathComponent:@"system.wav"];
     NSDate *microphoneStart = self.microphoneFirstBufferDate ?: self.recordingStartedAt ?: NSDate.date;
     NSDate *systemStart = self.systemAudioRecorder.firstBufferDate ?: self.recordingStartedAt ?: NSDate.date;
+    NSDate *recordingStart = self.recordingStartedAt ?: [microphoneStart earlierDate:systemStart];
     self.recording = NO;
     if (failure) NotieLogRecordingError([NSString stringWithFormat:@"Stopping recording because of error: %@", failure.localizedDescription ?: @"unknown error"]);
     else NotieLogRecordingMessage(@"Stopping microphone and Core Audio system recording normally.");
@@ -621,6 +644,129 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     notification.title = @"Recording saved";
     notification.informativeText = merged ? [NSString stringWithFormat:@"Merged audio: %@", mergedURL.path ?: @"ready"] : (outputURL.path ?: @"The audio files are ready.");
     [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
+
+    NSError *metadataError = nil;
+    BOOL metadataWritten = [self writeSessionMetadataAtURL:outputURL recordingStart:recordingStart microphoneStart:microphoneStart systemStart:systemStart endedAt:NSDate.date error:&metadataError];
+    if (!metadataWritten) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Could not write transcription metadata: %@", metadataError.localizedDescription ?: @"unknown error"]);
+    } else {
+        [self startTranscriptionForSessionAtURL:outputURL];
+    }
+}
+
+- (BOOL)writeSessionMetadataAtURL:(NSURL *)sessionURL recordingStart:(NSDate *)started microphoneStart:(NSDate *)microphoneStart systemStart:(NSDate *)systemStart endedAt:(NSDate *)endedAt error:(NSError **)outError {
+    NSDate *earliest = [microphoneStart earlierDate:systemStart];
+    NSISO8601DateFormatter *formatter = [NSISO8601DateFormatter new];
+    NSDictionary *metadata = @{
+        @"started": [formatter stringFromDate:started],
+        @"ended": [formatter stringFromDate:endedAt],
+        @"duration_seconds": @((NSInteger)MAX(0, round([endedAt timeIntervalSinceDate:started]))),
+        @"files": @{@"mic": @"mic.wav", @"system": @"system.wav"},
+        @"start_offset_ms": @{
+            @"mic": @((NSInteger)MAX(0, round([microphoneStart timeIntervalSinceDate:earliest] * 1000.0))),
+            @"system": @((NSInteger)MAX(0, round([systemStart timeIntervalSinceDate:earliest] * 1000.0)))
+        }
+    };
+    NSError *serializationError = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:metadata options:NSJSONWritingPrettyPrinted error:&serializationError];
+    if (!data) {
+        if (outError) *outError = serializationError;
+        return NO;
+    }
+    NSURL *metadataURL = [sessionURL URLByAppendingPathComponent:@"meta.json"];
+    if (![data writeToURL:metadataURL options:NSDataWritingAtomic error:outError]) return NO;
+    return YES;
+}
+
+- (void)retryPendingTranscriptions {
+    NSError *error = nil;
+    NSURL *markdownURL = [self markdownFileURLWithError:&error];
+    if (!markdownURL) return;
+    NSURL *recordingsURL = [[markdownURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"recordings" isDirectory:YES];
+    NSArray<NSURL *> *sessions = [[NSFileManager defaultManager] contentsOfDirectoryAtURL:recordingsURL includingPropertiesForKeys:@[NSURLIsDirectoryKey] options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+    for (NSURL *sessionURL in sessions) {
+        NSNumber *isDirectory = nil;
+        [sessionURL getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
+        if (!isDirectory.boolValue) continue;
+        NSURL *metaURL = [sessionURL URLByAppendingPathComponent:@"meta.json"];
+        NSURL *transcriptURL = [sessionURL URLByAppendingPathComponent:@"transcript.json"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:metaURL.path] && ![[NSFileManager defaultManager] fileExistsAtPath:transcriptURL.path]) {
+            [self startTranscriptionForSessionAtURL:sessionURL];
+        }
+    }
+}
+
+- (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL {
+    // Helpers live beside the executable in Contents/Helpers, not under the
+    // bundle's Resources directory. `pathForResource:…inDirectory:` only
+    // searches Resources, so it cannot find this executable in a built app.
+    NSURL *helperURL = [[NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Contents" isDirectory:YES]
+                       URLByAppendingPathComponent:@"Helpers/notie-transcriber"];
+    NSString *helperPath = helperURL.path;
+    if (helperPath.length == 0 || ![[NSFileManager defaultManager] isExecutableFileAtPath:helperPath]) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Transcription helper is missing or not executable: %@", helperPath ?: @"unknown"]);
+        return;
+    }
+    NSTask *task = [NSTask new];
+    task.executableURL = helperURL;
+    task.arguments = @[sessionURL.path];
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = pipe;
+    __weak AppDelegate *weakSelf = self;
+    pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
+        NSData *data = [handle availableData];
+        if (data.length == 0) return;
+        NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+        for (NSString *line in [output componentsSeparatedByString:@"\n"]) {
+            if (line.length == 0) continue;
+            NSArray<NSString *> *parts = [line componentsSeparatedByString:@"\t"];
+            if (parts.count < 2) continue;
+            NSString *message = parts[1];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                AppDelegate *strongSelf = weakSelf;
+                if (strongSelf) {
+                    strongSelf.statusItem.button.toolTip = [NSString stringWithFormat:@"Transcribing: %@", message];
+                    NotieLogRecordingMessage([NSString stringWithFormat:@"Transcription: %@", message]);
+                }
+            });
+        }
+    };
+    task.terminationHandler = ^(NSTask *finishedTask) {
+        pipe.fileHandleForReading.readabilityHandler = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AppDelegate *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf.activeTranscriptionTasks removeObject:finishedTask];
+            strongSelf.statusItem.button.toolTip = @"Notie";
+            NSUserNotification *result = [NSUserNotification new];
+            if (finishedTask.terminationStatus == 0) {
+                result.title = @"Transcript ready";
+                result.informativeText = sessionURL.path ?: @"The transcript was saved next to the recording.";
+                NotieLogRecordingMessage([NSString stringWithFormat:@"Transcript saved successfully: %@", sessionURL.path ?: @"unknown"]);
+            } else {
+                result.title = @"Transcription failed";
+                result.informativeText = @"The recording was preserved. Check transcribe.log in the recording folder.";
+                NotieLogRecordingError([NSString stringWithFormat:@"Transcription failed with status %d for %@", finishedTask.terminationStatus, sessionURL.path ?: @"unknown"]);
+            }
+            [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:result];
+        });
+    };
+    NSUserNotification *notification = [NSUserNotification new];
+    notification.title = @"Transcription started";
+    notification.informativeText = @"Audio is being transcribed locally on this Mac.";
+    [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
+    @try {
+        NSError *launchError = nil;
+        if (![task launchAndReturnError:&launchError]) {
+            [self.activeTranscriptionTasks removeObject:task];
+            NotieLogRecordingError([NSString stringWithFormat:@"Could not launch transcription helper: %@", launchError.localizedDescription ?: @"unknown error"]);
+            return;
+        }
+        [self.activeTranscriptionTasks addObject:task];
+    } @catch (NSException *exception) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Could not launch transcription helper: %@", exception.reason ?: @"unknown error"]);
+    }
 }
 
 - (void)buildWindow {

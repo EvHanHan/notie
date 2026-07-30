@@ -17,17 +17,66 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Build release zip
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/notie-signing-cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/notie-signing.keychain-db"
+
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 -D > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+      - name: Configure notarytool profile
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          KEYCHAIN_PATH="$RUNNER_TEMP/notie-signing.keychain-db"
+
+          echo "$APPLE_API_PRIVATE_KEY_BASE64" | base64 -D > "$KEY_PATH"
+          xcrun notarytool store-credentials "notie-notarytool" \
+            --key "$KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --keychain "$KEYCHAIN_PATH"
+
+      - name: Build signed and notarized release DMG
+        env:
+          SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_IDENTITY }}
+          NOTARY_KEYCHAIN_PROFILE: notie-notarytool
+          NOTARY_KEYCHAIN: ${{ runner.temp }}/notie-signing.keychain-db
         run: ./scripts/package.sh
 
       - name: Upload packaged app artifact
         uses: actions/upload-artifact@v4
         with:
           name: notie-release
-          path: dist/*.zip
+          path: dist/*.dmg
 
       - name: Publish GitHub release asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: dist/*.dmg
