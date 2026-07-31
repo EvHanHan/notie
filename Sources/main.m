@@ -4,6 +4,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreAudio/CoreAudio.h>
 #import <CoreAudio/AudioHardwareTapping.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <os/log.h>
 
 static NSString * const MarkdownFileBookmarkKey = @"MarkdownFileBookmark";
@@ -299,8 +300,10 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSMapTable<NSTextAttachment *, NSString *> *attachmentImageIDs;
 @property EKEventStore *eventStore;
 @property EventHotKeyRef hotKeyRef;
+@property EventHotKeyRef screenshotHotKeyRef;
 @property EventHandlerRef handlerRef;
 @property NSMenuItem *recordMenuItem;
+@property NSMenuItem *screenshotMenuItem;
 @property NSMenuItem *transcriptionProgressMenuItem;
 @property NSTextField *transcriptionProgressLabel;
 @property NSProgressIndicator *transcriptionProgressIndicator;
@@ -315,6 +318,8 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSURL *recordingOutputURL;
 @property NSURL *recordingFolderURL;
 @property BOOL recording;
+@property BOOL screenshotCaptureInProgress;
+@property NSWindow *screenshotFlashWindow;
 @property dispatch_queue_t recordingQueue;
 @property NSMutableSet<NSTask *> *activeTranscriptionTasks;
 - (void)showCaptureWindow:(id)sender;
@@ -323,11 +328,22 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 - (void)updateTranscriptionProgressForEvent:(NSString *)event message:(NSString *)message;
 - (void)finishTranscriptionProgressSuccessfully:(BOOL)succeeded;
 - (void)appendTranscriptionLogMessage:(NSString *)message;
+- (void)takeRecordingScreenshot;
+- (void)registerScreenshotHotKey;
+- (void)unregisterScreenshotHotKey;
+- (void)flashPrimaryDisplayForScreenshot;
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem;
 @end
 
 static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, void *userData) {
     AppDelegate *delegate = (__bridge AppDelegate *)userData;
-    dispatch_async(dispatch_get_main_queue(), ^{ [delegate showCaptureWindow:nil]; });
+    EventHotKeyID hotKeyID = {0};
+    GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, NULL, sizeof(hotKeyID), NULL, &hotKeyID);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (hotKeyID.signature != 'NOTI') return;
+        if (hotKeyID.id == 1) [delegate showCaptureWindow:nil];
+        else if (hotKeyID.id == 2) [delegate takeRecordingScreenshot];
+    });
     return noErr;
 }
 
@@ -347,6 +363,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [self unregisterScreenshotHotKey];
     if (_hotKeyRef) UnregisterEventHotKey(_hotKeyRef);
     if (_handlerRef) RemoveEventHandler(_handlerRef);
 }
@@ -401,6 +418,12 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.recordMenuItem = [[NSMenuItem alloc] initWithTitle:@"Record" action:@selector(toggleRecording:) keyEquivalent:@""];
     self.recordMenuItem.target = self;
     [menu addItem:self.recordMenuItem];
+    self.screenshotMenuItem = [[NSMenuItem alloc] initWithTitle:@"Take Screenshot" action:@selector(takeRecordingScreenshot) keyEquivalent:@"s"];
+    self.screenshotMenuItem.target = self;
+    self.screenshotMenuItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    self.screenshotMenuItem.enabled = NO;
+    self.screenshotMenuItem.toolTip = @"Available while recording. Saves a screenshot in the active recording folder.";
+    [menu addItem:self.screenshotMenuItem];
     [self buildTranscriptionProgressMenuItem];
     [menu addItem:self.transcriptionProgressMenuItem];
     [self buildTranscriptionLogMenuItem];
@@ -626,7 +649,9 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.recordingStartedAt = NSDate.date;
     self.recording = YES;
     self.recordMenuItem.title = @"Stop Recording";
+    self.screenshotMenuItem.enabled = YES;
     self.statusItem.button.toolTip = @"Recording audio…";
+    [self registerScreenshotHotKey];
     NotieLogRecordingMessage(@"Microphone and Core Audio system recording started successfully.");
 }
 
@@ -722,6 +747,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSDate *systemStart = self.systemAudioRecorder.firstBufferDate ?: self.recordingStartedAt ?: NSDate.date;
     NSDate *recordingStart = self.recordingStartedAt ?: [microphoneStart earlierDate:systemStart];
     self.recording = NO;
+    [self unregisterScreenshotHotKey];
+    self.screenshotMenuItem.enabled = NO;
     if (failure) NotieLogRecordingError([NSString stringWithFormat:@"Stopping recording because of error: %@", failure.localizedDescription ?: @"unknown error"]);
     else NotieLogRecordingMessage(@"Stopping microphone and Core Audio system recording normally.");
     self.recordMenuItem.title = @"Record";
@@ -958,6 +985,147 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     EventTypeSpec eventType = { kEventClassKeyboard, kEventHotKeyPressed };
     InstallEventHandler(GetApplicationEventTarget(), HotKeyHandler, 1, &eventType, (__bridge void *)self, &_handlerRef);
     RegisterEventHotKey(kVK_ANSI_K, cmdKey, hotKeyID, GetApplicationEventTarget(), 0, &_hotKeyRef);
+}
+
+- (void)registerScreenshotHotKey {
+    if (self.screenshotHotKeyRef || !self.recording) return;
+    EventHotKeyID hotKeyID;
+    hotKeyID.signature = 'NOTI';
+    hotKeyID.id = 2;
+    OSStatus status = RegisterEventHotKey(kVK_ANSI_S, cmdKey | shiftKey, hotKeyID, GetApplicationEventTarget(), 0, &_screenshotHotKeyRef);
+    if (status != noErr) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Could not register the recording screenshot shortcut (OSStatus %d).", (int)status]);
+        [self appendTranscriptionLogMessage:@"Screenshot shortcut unavailable for this recording."];
+    } else {
+        NotieLogRecordingMessage(@"Recording screenshot shortcut registered: Command-Shift-S.");
+    }
+}
+
+- (void)unregisterScreenshotHotKey {
+    if (!self.screenshotHotKeyRef) return;
+    UnregisterEventHotKey(self.screenshotHotKeyRef);
+    self.screenshotHotKeyRef = NULL;
+    NotieLogRecordingMessage(@"Recording screenshot shortcut unregistered.");
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
+    if (menuItem.action == @selector(takeRecordingScreenshot)) {
+        return self.recording && !self.screenshotCaptureInProgress;
+    }
+    return YES;
+}
+
+- (void)takeRecordingScreenshot {
+    if (!self.recording || !self.recordingOutputURL || self.screenshotCaptureInProgress) return;
+
+    if (!CGPreflightScreenCaptureAccess() && !CGRequestScreenCaptureAccess()) {
+        NotieLogRecordingError(@"Screen Recording permission is required to take recording screenshots.");
+        [self showErrorWithTitle:@"Screen Recording access is required" message:@"Allow Notie in System Settings > Privacy & Security > Screen Recording, then press Command-Shift-S again. Audio recording will continue."];
+        return;
+    }
+
+    NSURL *sessionURL = self.recordingOutputURL;
+    NSString *name = [NSString stringWithFormat:@"screenshot-%@.png", [self timestampString]];
+    NSURL *destinationURL = [self uniqueURLInDirectory:sessionURL preferredFilename:name fileManager:NSFileManager.defaultManager];
+    self.screenshotCaptureInProgress = YES;
+    self.statusItem.button.toolTip = @"Capturing screenshot…";
+    NotieLogRecordingMessage([NSString stringWithFormat:@"Recording screenshot requested: %@", destinationURL.path ?: @"unknown"]);
+
+    [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *contentError) {
+        if (contentError || !content) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.screenshotCaptureInProgress = NO;
+                NotieLogRecordingError([NSString stringWithFormat:@"Could not get screen content for screenshot: %@", contentError.localizedDescription ?: @"unknown error"]);
+                [self showErrorWithTitle:@"Couldn’t take screenshot" message:contentError.localizedDescription ?: @"Notie could not access the primary display. Audio recording will continue."];
+            });
+            return;
+        }
+
+        CGDirectDisplayID mainDisplayID = CGMainDisplayID();
+        SCDisplay *primaryDisplay = nil;
+        for (SCDisplay *display in content.displays) {
+            if (display.displayID == mainDisplayID) {
+                primaryDisplay = display;
+                break;
+            }
+        }
+        if (!primaryDisplay) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.screenshotCaptureInProgress = NO;
+                NotieLogRecordingError(@"The primary display was not available for screenshot capture.");
+                [self showErrorWithTitle:@"Couldn’t take screenshot" message:@"Notie could not find the primary display. Audio recording will continue."];
+            });
+            return;
+        }
+
+        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:primaryDisplay excludingWindows:@[]];
+        SCStreamConfiguration *configuration = [SCStreamConfiguration new];
+        configuration.width = CGDisplayPixelsWide(mainDisplayID);
+        configuration.height = CGDisplayPixelsHigh(mainDisplayID);
+        configuration.showsCursor = NO;
+        [SCScreenshotManager captureImageWithFilter:filter configuration:configuration completionHandler:^(CGImageRef image, NSError *captureError) {
+            NSError *writeError = nil;
+            if (!captureError && image) {
+                NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithCGImage:image];
+                NSData *pngData = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+                if (!pngData || ![pngData writeToURL:destinationURL options:NSDataWritingAtomic error:&writeError]) {
+                    if (!writeError) writeError = [NSError errorWithDomain:@"Notie" code:34 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not encode the screenshot as a PNG."}];
+                }
+            }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.screenshotCaptureInProgress = NO;
+                if (captureError || !image || writeError) {
+                    NSError *error = captureError ?: writeError;
+                    NotieLogRecordingError([NSString stringWithFormat:@"Recording screenshot failed: %@", error.localizedDescription ?: @"unknown error"]);
+                    [self showErrorWithTitle:@"Couldn’t take screenshot" message:error.localizedDescription ?: @"Notie could not capture the primary display. Audio recording will continue."];
+                    return;
+                }
+                NotieLogRecordingMessage([NSString stringWithFormat:@"Recording screenshot saved: %@", destinationURL.path ?: @"unknown"]);
+                if (self.recording) self.statusItem.button.toolTip = [NSString stringWithFormat:@"Screenshot saved: %@", destinationURL.lastPathComponent ?: @"ready"];
+                [self flashPrimaryDisplayForScreenshot];
+                NSUserNotification *notification = [NSUserNotification new];
+                notification.title = @"Screenshot saved";
+                notification.informativeText = destinationURL.path ?: @"Saved in the recording folder.";
+                [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
+            });
+        }];
+    }];
+}
+
+- (void)flashPrimaryDisplayForScreenshot {
+    CGDirectDisplayID mainDisplayID = CGMainDisplayID();
+    NSScreen *screen = nil;
+    for (NSScreen *candidate in NSScreen.screens) {
+        NSNumber *screenNumber = candidate.deviceDescription[@"NSScreenNumber"];
+        if (screenNumber.unsignedIntValue == mainDisplayID) {
+            screen = candidate;
+            break;
+        }
+    }
+    screen = screen ?: NSScreen.mainScreen;
+    if (!screen) return;
+
+    NSWindow *flashWindow = self.screenshotFlashWindow;
+    if (!flashWindow) {
+        flashWindow = [[NSWindow alloc] initWithContentRect:screen.frame styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO screen:screen];
+        flashWindow.opaque = NO;
+        flashWindow.backgroundColor = NSColor.whiteColor;
+        flashWindow.ignoresMouseEvents = YES;
+        flashWindow.level = NSStatusWindowLevel;
+        flashWindow.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+        self.screenshotFlashWindow = flashWindow;
+    }
+    [flashWindow setFrame:screen.frame display:NO];
+    flashWindow.alphaValue = 0.28;
+    [flashWindow orderFrontRegardless];
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+        context.duration = 0.24;
+        flashWindow.animator.alphaValue = 0.0;
+    } completionHandler:^{
+        [flashWindow orderOut:nil];
+        flashWindow.alphaValue = 1.0;
+    }];
 }
 
 - (void)showCaptureWindow:(id)sender {

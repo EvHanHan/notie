@@ -80,6 +80,7 @@ env CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR" \
   -framework EventKit \
   -framework AVFoundation \
   -framework CoreAudio \
+  -framework ScreenCaptureKit \
   "$ROOT_DIR/Sources/main.m" \
   -o "$MACOS_DIR/$APP_NAME"
 
