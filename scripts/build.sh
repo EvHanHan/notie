@@ -58,9 +58,9 @@ done
 TRANSCRIBER_DIR="$ROOT_DIR/Transcriber"
 ARM_TARGET="aarch64-apple-darwin"
 X86_TARGET="x86_64-apple-darwin"
-TRANSCRIBE_CMAKE_ARGS="-DGGML_NATIVE=OFF" \
+TRANSCRIBE_CMAKE_ARGS="-DGGML_NATIVE=OFF -DTRANSCRIBE_METAL=OFF" \
   cargo build --manifest-path "$TRANSCRIBER_DIR/Cargo.toml" --release --target "$ARM_TARGET"
-TRANSCRIBE_CMAKE_ARGS="-DGGML_NATIVE=OFF" \
+TRANSCRIBE_CMAKE_ARGS="-DGGML_NATIVE=OFF -DTRANSCRIBE_METAL=OFF" \
   cargo build --manifest-path "$TRANSCRIBER_DIR/Cargo.toml" --release --target "$X86_TARGET"
 lipo -create \
   "$TRANSCRIBER_DIR/target/$ARM_TARGET/release/notie-transcriber" \
