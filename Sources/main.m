@@ -16,6 +16,7 @@ static NSString * const SaveDestinationMarkdown = @"markdown";
 static NSString * const SaveDestinationAppleNotes = @"appleNotes";
 static NSString * const SaveDestinationAppleReminders = @"appleReminders";
 static unichar const ImagePreviewPlaceholderCharacter = 0xFFFC;
+typedef BOOL (^NotieTranscriptionCompletion)(BOOL helperSucceeded, NSURL *sessionURL, NSError **outError);
 
 static os_log_t NotieRecordingLog(void) {
     static os_log_t log;
@@ -324,6 +325,11 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSMutableSet<NSTask *> *activeTranscriptionTasks;
 - (void)showCaptureWindow:(id)sender;
 - (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL;
+- (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL completion:(NotieTranscriptionCompletion)completion;
+- (void)chooseAudioFileForTranscription:(id)sender;
+- (void)transcribeAudioFileAtURL:(NSURL *)audioURL;
+- (BOOL)convertAudioAtURL:(NSURL *)inputURL toWAVAtURL:(NSURL *)outputURL duration:(NSTimeInterval *)outDuration error:(NSError **)outError;
+- (NSArray<NSURL *> *)availableTranscriptURLsForAudioURL:(NSURL *)audioURL;
 - (void)showTranscriptionProgressWithMessage:(NSString *)message;
 - (void)updateTranscriptionProgressForEvent:(NSString *)event message:(NSString *)message;
 - (void)finishTranscriptionProgressSuccessfully:(BOOL)succeeded;
@@ -424,14 +430,20 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.screenshotMenuItem.enabled = NO;
     self.screenshotMenuItem.toolTip = @"Available while recording. Saves a screenshot in the active recording folder.";
     [menu addItem:self.screenshotMenuItem];
-    [self buildTranscriptionProgressMenuItem];
-    [menu addItem:self.transcriptionProgressMenuItem];
-    [self buildTranscriptionLogMenuItem];
-    [menu addItem:self.transcriptionLogMenuItem];
     self.recordingsFolderMenuItem = [[NSMenuItem alloc] initWithTitle:@"Recordings Folder: None" action:@selector(chooseRecordingsFolder:) keyEquivalent:@""];
     self.recordingsFolderMenuItem.target = self;
     [menu addItem:self.recordingsFolderMenuItem];
     [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *transcribeAudioItem = [[NSMenuItem alloc] initWithTitle:@"Transcribe Audio File…" action:@selector(chooseAudioFileForTranscription:) keyEquivalent:@""];
+    transcribeAudioItem.target = self;
+    [menu addItem:transcribeAudioItem];
+    [self buildTranscriptionProgressMenuItem];
+    [menu addItem:self.transcriptionProgressMenuItem];
+    [self buildTranscriptionLogMenuItem];
+    [menu addItem:self.transcriptionLogMenuItem];
+    [menu addItem:[NSMenuItem separatorItem]];
+
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"New Note" action:@selector(showCaptureWindow:) keyEquivalent:@"k"]];
     [menu addItem:[[NSMenuItem alloc] initWithTitle:@"Save Note" action:@selector(saveNote:) keyEquivalent:@"\r"]];
     self.markdownTargetMenuItem = [[NSMenuItem alloc] initWithTitle:@"Default Target File: None" action:@selector(chooseMarkdownFile:) keyEquivalent:@"o"];
@@ -752,8 +764,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     if (failure) NotieLogRecordingError([NSString stringWithFormat:@"Stopping recording because of error: %@", failure.localizedDescription ?: @"unknown error"]);
     else NotieLogRecordingMessage(@"Stopping microphone and Core Audio system recording normally.");
     self.recordMenuItem.title = @"Record";
-    [self showTranscriptionProgressWithMessage:@"Preparing audio for transcription…"];
-    [self appendTranscriptionLogMessage:@"Stop pressed — preparing audio files."];
     [self.systemAudioRecorder stop];
     self.systemAudioRecorder = nil;
     [self.audioEngine stop];
@@ -788,14 +798,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
 
     NSError *metadataError = nil;
-    BOOL metadataWritten = [self writeSessionMetadataAtURL:outputURL recordingStart:recordingStart microphoneStart:microphoneStart systemStart:systemStart endedAt:NSDate.date error:&metadataError];
-    if (!metadataWritten) {
-        [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Could not save transcription metadata: %@", metadataError.localizedDescription ?: @"unknown error"]];
-        [self finishTranscriptionProgressSuccessfully:NO];
-        NotieLogRecordingError([NSString stringWithFormat:@"Could not write transcription metadata: %@", metadataError.localizedDescription ?: @"unknown error"]);
-    } else {
-        [self appendTranscriptionLogMessage:@"Starting transcription helper."];
-        [self startTranscriptionForSessionAtURL:outputURL];
+    if (![self writeSessionMetadataAtURL:outputURL recordingStart:recordingStart microphoneStart:microphoneStart systemStart:systemStart endedAt:NSDate.date error:&metadataError]) {
+        NotieLogRecordingError([NSString stringWithFormat:@"Could not write recording metadata: %@", metadataError.localizedDescription ?: @"unknown error"]);
     }
 }
 
@@ -824,11 +828,16 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL {
+    [self startTranscriptionForSessionAtURL:sessionURL completion:nil];
+}
+
+- (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL completion:(NotieTranscriptionCompletion)completion {
     // bundleURL is the .app directory; the helper is packaged at Contents/Helpers.
     NSURL *helperURL = [NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Contents/Helpers/notie-transcriber"];
     NSString *helperPath = helperURL.path;
     if (helperPath.length == 0 || ![[NSFileManager defaultManager] isExecutableFileAtPath:helperPath]) {
         [self appendTranscriptionLogMessage:@"Transcription helper is missing or is not executable."];
+        if (completion) completion(NO, nil, nil);
         [self finishTranscriptionProgressSuccessfully:NO];
         NotieLogRecordingError([NSString stringWithFormat:@"Transcription helper is missing or not executable: %@", helperPath ?: @"unknown"]);
         return;
@@ -867,12 +876,20 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
             AppDelegate *strongSelf = weakSelf;
             if (!strongSelf) return;
             [strongSelf.activeTranscriptionTasks removeObject:finishedTask];
-            [strongSelf finishTranscriptionProgressSuccessfully:(finishedTask.terminationStatus == 0)];
+            BOOL succeeded = finishedTask.terminationStatus == 0;
+            NSError *completionError = nil;
+            if (completion && !completion(succeeded, sessionURL, &completionError)) succeeded = NO;
+            if (completionError) {
+                [strongSelf appendTranscriptionLogMessage:completionError.localizedDescription ?: @"Could not save the transcript next to the selected audio file."];
+                NotieLogRecordingError([NSString stringWithFormat:@"Standalone transcription completion failed: %@", completionError.localizedDescription ?: @"unknown error"]);
+                [strongSelf showErrorWithTitle:@"Couldn’t save transcript" message:completionError.localizedDescription ?: @"The audio file was not changed."];
+            }
+            [strongSelf finishTranscriptionProgressSuccessfully:succeeded];
             NSUserNotification *result = [NSUserNotification new];
-            if (finishedTask.terminationStatus == 0) {
+            if (succeeded) {
                 result.title = @"Transcript ready";
-                result.informativeText = sessionURL.path ?: @"The transcript was saved next to the recording.";
-                NotieLogRecordingMessage([NSString stringWithFormat:@"Transcript saved successfully: %@", sessionURL.path ?: @"unknown"]);
+                result.informativeText = completion ? @"The transcript was saved next to the selected audio file." : (sessionURL.path ?: @"The transcript was saved next to the recording.");
+                NotieLogRecordingMessage([NSString stringWithFormat:@"Transcript saved successfully: %@", completion ? @"selected audio file" : (sessionURL.path ?: @"unknown")]);
                 [strongSelf appendTranscriptionLogMessage:@"Transcript saved successfully."];
             } else {
                 result.title = @"Transcription failed";
@@ -891,6 +908,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         NSError *launchError = nil;
         if (![task launchAndReturnError:&launchError]) {
             [self.activeTranscriptionTasks removeObject:task];
+            if (completion) completion(NO, nil, nil);
             [self finishTranscriptionProgressSuccessfully:NO];
             [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Could not start helper: %@", launchError.localizedDescription ?: @"unknown error"]];
             NotieLogRecordingError([NSString stringWithFormat:@"Could not launch transcription helper: %@", launchError.localizedDescription ?: @"unknown error"]);
@@ -899,10 +917,147 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         [self.activeTranscriptionTasks addObject:task];
         [self appendTranscriptionLogMessage:@"Transcription helper started."];
     } @catch (NSException *exception) {
+        if (completion) completion(NO, nil, nil);
         [self finishTranscriptionProgressSuccessfully:NO];
         [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Could not start helper: %@", exception.reason ?: @"unknown error"]];
         NotieLogRecordingError([NSString stringWithFormat:@"Could not launch transcription helper: %@", exception.reason ?: @"unknown error"]);
     }
+}
+
+- (void)chooseAudioFileForTranscription:(id)sender {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.title = @"Choose Audio File to Transcribe";
+    panel.prompt = @"Transcribe";
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = NO;
+    panel.allowedFileTypes = @[@"m4a", @"mp3", @"wav", @"aif", @"aiff", @"caf"];
+    [self positionPanelNearMenuBarWhenShown:panel];
+    if ([panel runModal] == NSModalResponseOK && panel.URL) [self transcribeAudioFileAtURL:panel.URL];
+}
+
+- (NSArray<NSURL *> *)availableTranscriptURLsForAudioURL:(NSURL *)audioURL {
+    NSURL *directory = [audioURL URLByDeletingLastPathComponent];
+    NSString *baseName = audioURL.URLByDeletingPathExtension.lastPathComponent;
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    for (NSUInteger version = 1; ; version++) {
+        NSString *suffix = version == 1 ? @".transcript" : [NSString stringWithFormat:@".transcript-%lu", (unsigned long)version];
+        NSURL *markdownURL = [directory URLByAppendingPathComponent:[baseName stringByAppendingFormat:@"%@.md", suffix]];
+        NSURL *jsonURL = [directory URLByAppendingPathComponent:[baseName stringByAppendingFormat:@"%@.json", suffix]];
+        if (![fileManager fileExistsAtPath:markdownURL.path] && ![fileManager fileExistsAtPath:jsonURL.path]) return @[markdownURL, jsonURL];
+    }
+}
+
+- (BOOL)convertAudioAtURL:(NSURL *)inputURL toWAVAtURL:(NSURL *)outputURL duration:(NSTimeInterval *)outDuration error:(NSError **)outError {
+    NSError *error = nil;
+    AVAudioFile *inputFile = [[AVAudioFile alloc] initForReading:inputURL error:&error];
+    if (!inputFile) {
+        if (outError) *outError = error ?: [NSError errorWithDomain:@"Notie" code:41 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not decode the selected audio file."}];
+        return NO;
+    }
+    AVAudioFormat *outputFormat = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:16000 channels:1];
+    AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inputFile.processingFormat toFormat:outputFormat];
+    AVAudioFile *outputFile = [[AVAudioFile alloc] initForWriting:outputURL settings:outputFormat.settings commonFormat:AVAudioPCMFormatFloat32 interleaved:NO error:&error];
+    if (!converter || !outputFile) {
+        if (outError) *outError = error ?: [NSError errorWithDomain:@"Notie" code:42 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not prepare the selected audio for transcription."}];
+        return NO;
+    }
+
+    __block BOOL reachedEnd = NO;
+    __block NSError *readError = nil;
+    AVAudioFramePosition writtenFrames = 0;
+    while (YES) {
+        AVAudioPCMBuffer *outputBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outputFormat frameCapacity:4096];
+        AVAudioConverterOutputStatus status = [converter convertToBuffer:outputBuffer error:&error withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus *outStatus) {
+            if (reachedEnd) {
+                *outStatus = AVAudioConverterInputStatus_EndOfStream;
+                return nil;
+            }
+            AVAudioPCMBuffer *inputBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:inputFile.processingFormat frameCapacity:4096];
+            if (![inputFile readIntoBuffer:inputBuffer error:&readError] || readError || inputBuffer.frameLength == 0) {
+                reachedEnd = YES;
+                *outStatus = AVAudioConverterInputStatus_EndOfStream;
+                return nil;
+            }
+            *outStatus = AVAudioConverterInputStatus_HaveData;
+            return inputBuffer;
+        }];
+        if (readError || status == AVAudioConverterOutputStatus_Error) {
+            if (outError) *outError = readError ?: error ?: [NSError errorWithDomain:@"Notie" code:43 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not convert the selected audio file."}];
+            return NO;
+        }
+        if (outputBuffer.frameLength > 0) {
+            if (![outputFile writeFromBuffer:outputBuffer error:&error]) {
+                if (outError) *outError = error;
+                return NO;
+            }
+            writtenFrames += outputBuffer.frameLength;
+        }
+        if (status == AVAudioConverterOutputStatus_EndOfStream) break;
+    }
+    if (outDuration) *outDuration = writtenFrames / outputFormat.sampleRate;
+    return YES;
+}
+
+- (void)transcribeAudioFileAtURL:(NSURL *)audioURL {
+    if (![audioURL startAccessingSecurityScopedResource]) {
+        [self showErrorWithTitle:@"Couldn’t access audio file" message:@"Choose the audio file again and try transcription."];
+        return;
+    }
+    NSArray<NSURL *> *outputURLs = [self availableTranscriptURLsForAudioURL:audioURL];
+    NSURL *markdownURL = outputURLs[0];
+    NSURL *jsonURL = outputURLs[1];
+    [self showTranscriptionProgressWithMessage:@"Preparing selected audio…"];
+    [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Preparing %@ for transcription.", audioURL.lastPathComponent]];
+    dispatch_async(self.recordingQueue, ^{
+        NSFileManager *fileManager = NSFileManager.defaultManager;
+        NSURL *temporaryRoot = [NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES];
+        NSURL *jobURL = [[temporaryRoot URLByAppendingPathComponent:@"NotieTranscriptions" isDirectory:YES] URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+        NSError *error = nil;
+        BOOL prepared = [fileManager createDirectoryAtURL:jobURL withIntermediateDirectories:YES attributes:nil error:&error];
+        NSURL *wavURL = [jobURL URLByAppendingPathComponent:@"audio.wav"];
+        NSTimeInterval duration = 0;
+        if (prepared) prepared = [self convertAudioAtURL:audioURL toWAVAtURL:wavURL duration:&duration error:&error];
+        if (prepared) {
+            NSDictionary *metadata = @{
+                @"duration_seconds": @((NSInteger)MAX(0, round(duration))),
+                @"files": @{@"mic": @"audio.wav", @"system": @"system.wav"},
+                @"start_offset_ms": @{@"mic": @0, @"system": @0},
+                @"speaker_labels": @{@"mic": @"audio"}
+            };
+            NSData *data = [NSJSONSerialization dataWithJSONObject:metadata options:NSJSONWritingPrettyPrinted error:&error];
+            prepared = data && [data writeToURL:[jobURL URLByAppendingPathComponent:@"meta.json"] options:NSDataWritingAtomic error:&error];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!prepared) {
+                [fileManager removeItemAtURL:jobURL error:nil];
+                [audioURL stopAccessingSecurityScopedResource];
+                [self finishTranscriptionProgressSuccessfully:NO];
+                NSString *message = error.localizedDescription ?: @"Notie could not decode or convert the selected audio file.";
+                [self appendTranscriptionLogMessage:message];
+                NotieLogRecordingError(message);
+                [self showErrorWithTitle:@"Couldn’t prepare audio" message:message];
+                return;
+            }
+            [self startTranscriptionForSessionAtURL:jobURL completion:^BOOL(BOOL helperSucceeded, NSURL *sessionURL, NSError **outError) {
+                BOOL saved = helperSucceeded;
+                NSError *copyError = nil;
+                if (saved) {
+                    NSURL *generatedMarkdownURL = [sessionURL URLByAppendingPathComponent:@"transcript.md"];
+                    NSURL *generatedJSONURL = [sessionURL URLByAppendingPathComponent:@"transcript.json"];
+                    saved = [fileManager copyItemAtURL:generatedMarkdownURL toURL:markdownURL error:&copyError] && [fileManager copyItemAtURL:generatedJSONURL toURL:jsonURL error:&copyError];
+                    if (!saved) {
+                        [fileManager removeItemAtURL:markdownURL error:nil];
+                        [fileManager removeItemAtURL:jsonURL error:nil];
+                    }
+                }
+                [fileManager removeItemAtURL:jobURL error:nil];
+                [audioURL stopAccessingSecurityScopedResource];
+                if (!saved && outError) *outError = copyError;
+                return saved;
+            }];
+        });
+    });
 }
 
 - (void)buildWindow {

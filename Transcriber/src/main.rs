@@ -8,17 +8,23 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use transcribe_cpp::{Model, RunOptions};
+use transcribe_cpp::{Model, RunOptions, Session};
 
 const MODEL_NAME: &str = "parakeet-tdt-0.6b-v2-Q4_K_M.gguf";
 const MODEL_URL: &str = "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v2-gguf/resolve/07cee0616125a08ef619729bb47f40ef747e4bc4/parakeet-tdt-0.6b-v2-Q4_K_M.gguf?download=true";
 const MODEL_SHA256: &str = "4853f9653f641d376e6f7de65d73c7a34a73677704a606727bf51acc83f999f3";
+// Parakeet's offline decoder allocates its computation graph for the complete
+// input buffer. Keep calls bounded so a long meeting cannot exhaust memory.
+const TRANSCRIPTION_CHUNK_SECONDS: usize = 30;
+const TRANSCRIPTION_SAMPLE_RATE: usize = 16_000;
 
 #[derive(Deserialize)]
 struct SessionMeta {
     duration_seconds: i64,
     files: TrackFiles,
     start_offset_ms: TrackOffsets,
+    #[serde(default)]
+    speaker_labels: TrackSpeakerLabels,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +37,22 @@ struct TrackFiles {
 struct TrackOffsets {
     mic: i64,
     system: i64,
+}
+
+#[derive(Default, Deserialize)]
+struct TrackSpeakerLabels {
+    mic: Option<String>,
+    system: Option<String>,
+}
+
+impl SessionMeta {
+    fn speaker_for_mic(&self) -> &str {
+        self.speaker_labels.mic.as_deref().unwrap_or("me")
+    }
+
+    fn speaker_for_system(&self) -> &str {
+        self.speaker_labels.system.as_deref().unwrap_or("them")
+    }
 }
 
 #[derive(Serialize)]
@@ -68,7 +90,8 @@ fn run() -> Result<()> {
         .ok_or_else(|| anyhow!("Usage: notie-transcriber <session-directory>"))?;
     let session = PathBuf::from(session);
     let meta: SessionMeta = serde_json::from_reader(
-        File::open(session.join("meta.json")).context("Session is missing or has invalid meta.json")?,
+        File::open(session.join("meta.json"))
+            .context("Session is missing or has invalid meta.json")?,
     )?;
 
     emit("status\tLoading Parakeet TDT 0.6B v2 model (downloads once if needed)…");
@@ -79,9 +102,11 @@ fn run() -> Result<()> {
         .session()
         .context("Could not create a transcription session")?;
 
+    let mic_speaker = meta.speaker_for_mic().to_string();
+    let system_speaker = meta.speaker_for_system().to_string();
     let tracks = [
-        ("me", meta.files.mic, meta.start_offset_ms.mic),
-        ("them", meta.files.system, meta.start_offset_ms.system),
+        (mic_speaker, meta.files.mic, meta.start_offset_ms.mic),
+        (system_speaker, meta.files.system, meta.start_offset_ms.system),
     ];
     let mut segments = Vec::new();
     for (speaker, filename, offset_ms) in tracks {
@@ -94,23 +119,22 @@ fn run() -> Result<()> {
         if audio.is_empty() {
             continue;
         }
-        let result = session_model
-            .run(&audio, &RunOptions::default())
-            .with_context(|| format!("Could not transcribe {}", path.display()))?;
-        let text = result.text.trim().to_string();
-        if !text.is_empty() {
-            let start = offset_ms.max(0) as f64 / 1000.0;
-            segments.push(TranscriptSegment {
-                speaker: speaker.to_string(),
-                start,
-                end: start + duration,
-                text,
-                confidence: 0.0,
-            });
-        }
+        transcribe_track(
+            &mut session_model,
+            &audio,
+            duration,
+            &speaker,
+            offset_ms,
+            &path,
+            &mut segments,
+        )?;
     }
 
-    segments.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    segments.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let document = TranscriptDocument {
         engine: "transcribe-cpp".into(),
         model: "Parakeet TDT 0.6B v2 Q4_K_M".into(),
@@ -124,6 +148,76 @@ fn run() -> Result<()> {
     fs::write(session.join("transcript.md"), render_markdown(&document))
         .context("Could not write transcript.md")?;
     emit("status\tTranscript ready");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata(labels: &str) -> SessionMeta {
+        serde_json::from_str(&format!(
+            r#"{{
+                "duration_seconds": 1,
+                "files": {{"mic": "mic.wav", "system": "system.wav"}},
+                "start_offset_ms": {{"mic": 0, "system": 0}}
+                {labels}
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn recording_metadata_uses_existing_speaker_names() {
+        let meta = metadata("");
+        assert_eq!(meta.speaker_for_mic(), "me");
+        assert_eq!(meta.speaker_for_system(), "them");
+    }
+
+    #[test]
+    fn imported_audio_can_override_the_single_track_label() {
+        let meta = metadata(r#", "speaker_labels": {"mic": "audio"}"#);
+        assert_eq!(meta.speaker_for_mic(), "audio");
+        assert_eq!(meta.speaker_for_system(), "them");
+    }
+}
+
+fn transcribe_track(
+    session: &mut Session,
+    audio: &[f32],
+    duration: f64,
+    speaker: &str,
+    offset_ms: i64,
+    path: &Path,
+    segments: &mut Vec<TranscriptSegment>,
+) -> Result<()> {
+    let chunk_samples = TRANSCRIPTION_CHUNK_SECONDS * TRANSCRIPTION_SAMPLE_RATE;
+    let track_start = offset_ms.max(0) as f64 / 1000.0;
+    for (index, chunk) in audio.chunks(chunk_samples).enumerate() {
+        let result = session
+            .run(chunk, &RunOptions::default())
+            .with_context(|| {
+                format!(
+                    "Could not transcribe {} (chunk {})",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+        let text = result.text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let chunk_start = index as f64 * TRANSCRIPTION_CHUNK_SECONDS as f64;
+        let chunk_end =
+            (chunk_start + chunk.len() as f64 / TRANSCRIPTION_SAMPLE_RATE as f64).min(duration);
+        segments.push(TranscriptSegment {
+            speaker: speaker.to_string(),
+            start: track_start + chunk_start,
+            end: track_start + chunk_end,
+            text,
+            confidence: 0.0,
+        });
+    }
     Ok(())
 }
 
@@ -142,9 +236,14 @@ fn ensure_model() -> Result<PathBuf> {
         .build()?
         .get(MODEL_URL)
         .send()
-        .map_err(|error| anyhow!("Could not download the transcription model from {MODEL_URL}: {error}"))?;
+        .map_err(|error| {
+            anyhow!("Could not download the transcription model from {MODEL_URL}: {error}")
+        })?;
     if !response.status().is_success() {
-        return Err(anyhow!("The transcription model download failed with HTTP {}", response.status()));
+        return Err(anyhow!(
+            "The transcription model download failed with HTTP {}",
+            response.status()
+        ));
     }
     let total = response.content_length();
     let partial = destination.with_extension("gguf.part");
@@ -160,7 +259,10 @@ fn ensure_model() -> Result<PathBuf> {
         output.write_all(&buffer[..count])?;
         downloaded += count as u64;
         if let Some(total) = total {
-            emit(&format!("progress\t{}", (downloaded.saturating_mul(100) / total).min(100)));
+            emit(&format!(
+                "progress\t{}",
+                (downloaded.saturating_mul(100) / total).min(100)
+            ));
         }
     }
     output.sync_all()?;
@@ -187,7 +289,8 @@ fn sha256(path: &Path) -> Result<String> {
 }
 
 fn read_wav_16khz_mono(path: &Path) -> Result<(Vec<f32>, f64)> {
-    let mut reader = WavReader::open(path).with_context(|| format!("Could not open {}", path.display()))?;
+    let mut reader =
+        WavReader::open(path).with_context(|| format!("Could not open {}", path.display()))?;
     let spec = reader.spec();
     if spec.channels == 0 || spec.sample_rate == 0 {
         return Err(anyhow!("Invalid WAV format in {}", path.display()));
@@ -229,15 +332,26 @@ fn read_wav_16khz_mono(path: &Path) -> Result<(Vec<f32>, f64)> {
         let left = position.floor() as usize;
         let right = (left + 1).min(mono.len().saturating_sub(1));
         let fraction = (position - left as f64) as f32;
-        resampled.push(mono[left.min(mono.len().saturating_sub(1))] * (1.0 - fraction) + mono[right] * fraction);
+        resampled.push(
+            mono[left.min(mono.len().saturating_sub(1))] * (1.0 - fraction)
+                + mono[right] * fraction,
+        );
     }
     Ok((resampled, duration))
 }
 
 fn render_markdown(document: &TranscriptDocument) -> String {
-    let mut output = format!("# Transcript\n\nEngine: {} — {}\n\n", document.engine, document.model);
+    let mut output = format!(
+        "# Transcript\n\nEngine: {} — {}\n\n",
+        document.engine, document.model
+    );
     for segment in &document.segments {
-        output.push_str(&format!("[{}] **{}**: {}\n\n", format_time(segment.start), segment.speaker, segment.text));
+        output.push_str(&format!(
+            "[{}] **{}**: {}\n\n",
+            format_time(segment.start),
+            segment.speaker,
+            segment.text
+        ));
     }
     output
 }
@@ -248,7 +362,10 @@ fn format_time(seconds: f64) -> String {
 }
 
 fn append_log(session: &Path, message: &str) -> Result<()> {
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(session.join("transcribe.log"))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(session.join("transcribe.log"))?;
     writeln!(file, "[{}] {}", iso8601_now(), message)?;
     Ok(())
 }
