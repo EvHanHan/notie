@@ -329,6 +329,7 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 - (void)chooseAudioFileForTranscription:(id)sender;
 - (void)transcribeAudioFileAtURL:(NSURL *)audioURL;
 - (BOOL)convertAudioAtURL:(NSURL *)inputURL toWAVAtURL:(NSURL *)outputURL duration:(NSTimeInterval *)outDuration error:(NSError **)outError;
+- (BOOL)extractAudioFromMediaAtURL:(NSURL *)inputURL toM4AAtURL:(NSURL *)outputURL error:(NSError **)outError;
 - (NSArray<NSURL *> *)availableTranscriptURLsForAudioURL:(NSURL *)audioURL;
 - (void)showTranscriptionProgressWithMessage:(NSString *)message;
 - (void)updateTranscriptionProgressForEvent:(NSString *)event message:(NSString *)message;
@@ -435,7 +436,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [menu addItem:self.recordingsFolderMenuItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *transcribeAudioItem = [[NSMenuItem alloc] initWithTitle:@"Transcribe Audio File…" action:@selector(chooseAudioFileForTranscription:) keyEquivalent:@""];
+    NSMenuItem *transcribeAudioItem = [[NSMenuItem alloc] initWithTitle:@"Transcribe Audio or Video File…" action:@selector(chooseAudioFileForTranscription:) keyEquivalent:@""];
     transcribeAudioItem.target = self;
     [menu addItem:transcribeAudioItem];
     [self buildTranscriptionProgressMenuItem];
@@ -926,12 +927,12 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
 - (void)chooseAudioFileForTranscription:(id)sender {
     NSOpenPanel *panel = [NSOpenPanel openPanel];
-    panel.title = @"Choose Audio File to Transcribe";
+    panel.title = @"Choose Audio or Video File to Transcribe";
     panel.prompt = @"Transcribe";
     panel.canChooseFiles = YES;
     panel.canChooseDirectories = NO;
     panel.allowsMultipleSelection = NO;
-    panel.allowedFileTypes = @[@"m4a", @"mp3", @"wav", @"aif", @"aiff", @"caf"];
+    panel.allowedFileTypes = @[@"m4a", @"mp3", @"wav", @"aif", @"aiff", @"caf", @"mp4", @"m4v", @"mov", @"avi", @"mkv", @"webm", @"mpeg", @"mpg", @"3gp", @"3g2"];
     [self positionPanelNearMenuBarWhenShown:panel];
     if ([panel runModal] == NSModalResponseOK && panel.URL) [self transcribeAudioFileAtURL:panel.URL];
 }
@@ -948,12 +949,47 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     }
 }
 
+- (BOOL)extractAudioFromMediaAtURL:(NSURL *)inputURL toM4AAtURL:(NSURL *)outputURL error:(NSError **)outError {
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:inputURL options:nil];
+    if ([[asset tracksWithMediaType:AVMediaTypeAudio] count] == 0) {
+        if (outError) *outError = [NSError errorWithDomain:@"Notie" code:44 userInfo:@{NSLocalizedDescriptionKey: @"The selected video does not contain an audio track."}];
+        return NO;
+    }
+
+    AVAssetExportSession *exportSession = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+    if (!exportSession) {
+        if (outError) *outError = [NSError errorWithDomain:@"Notie" code:45 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not extract audio from the selected video."}];
+        return NO;
+    }
+    exportSession.outputURL = outputURL;
+    exportSession.outputFileType = AVFileTypeAppleM4A;
+    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+    [exportSession exportAsynchronouslyWithCompletionHandler:^{
+        dispatch_semaphore_signal(finished);
+    }];
+    dispatch_semaphore_wait(finished, DISPATCH_TIME_FOREVER);
+    if (exportSession.status != AVAssetExportSessionStatusCompleted) {
+        if (outError) *outError = exportSession.error ?: [NSError errorWithDomain:@"Notie" code:46 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not extract audio from the selected video."}];
+        return NO;
+    }
+    return YES;
+}
+
 - (BOOL)convertAudioAtURL:(NSURL *)inputURL toWAVAtURL:(NSURL *)outputURL duration:(NSTimeInterval *)outDuration error:(NSError **)outError {
     NSError *error = nil;
     AVAudioFile *inputFile = [[AVAudioFile alloc] initForReading:inputURL error:&error];
     if (!inputFile) {
-        if (outError) *outError = error ?: [NSError errorWithDomain:@"Notie" code:41 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not decode the selected audio file."}];
-        return NO;
+        NSURL *extractedAudioURL = [[outputURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"extracted-audio.m4a"];
+        [[NSFileManager defaultManager] removeItemAtURL:extractedAudioURL error:nil];
+        if (![self extractAudioFromMediaAtURL:inputURL toM4AAtURL:extractedAudioURL error:&error]) {
+            if (outError) *outError = error ?: [NSError errorWithDomain:@"Notie" code:41 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not decode the selected audio or extract an audio track from the selected video."}];
+            return NO;
+        }
+        inputFile = [[AVAudioFile alloc] initForReading:extractedAudioURL error:&error];
+        if (!inputFile) {
+            if (outError) *outError = error ?: [NSError errorWithDomain:@"Notie" code:47 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not decode the audio extracted from the selected video."}];
+            return NO;
+        }
     }
     AVAudioFormat *outputFormat = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:16000 channels:1];
     AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inputFile.processingFormat toFormat:outputFormat];
@@ -1007,7 +1043,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSArray<NSURL *> *outputURLs = [self availableTranscriptURLsForAudioURL:audioURL];
     NSURL *markdownURL = outputURLs[0];
     NSURL *jsonURL = outputURLs[1];
-    [self showTranscriptionProgressWithMessage:@"Preparing selected audio…"];
+    [self showTranscriptionProgressWithMessage:@"Preparing selected media…"];
     [self appendTranscriptionLogMessage:[NSString stringWithFormat:@"Preparing %@ for transcription.", audioURL.lastPathComponent]];
     dispatch_async(self.recordingQueue, ^{
         NSFileManager *fileManager = NSFileManager.defaultManager;
@@ -1033,10 +1069,10 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
                 [fileManager removeItemAtURL:jobURL error:nil];
                 [audioURL stopAccessingSecurityScopedResource];
                 [self finishTranscriptionProgressSuccessfully:NO];
-                NSString *message = error.localizedDescription ?: @"Notie could not decode or convert the selected audio file.";
+                NSString *message = error.localizedDescription ?: @"Notie could not decode or convert the selected file.";
                 [self appendTranscriptionLogMessage:message];
                 NotieLogRecordingError(message);
-                [self showErrorWithTitle:@"Couldn’t prepare audio" message:message];
+                [self showErrorWithTitle:@"Couldn’t prepare file" message:message];
                 return;
             }
             [self startTranscriptionForSessionAtURL:jobURL completion:^BOOL(BOOL helperSucceeded, NSURL *sessionURL, NSError **outError) {
