@@ -31,8 +31,8 @@
 	<key>NSRemindersUsageDescription</key>
 	<string>Notie creates reminders from your typed ideas.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Notie records microphone audio together with your Mac’s system audio.</string>
+	<string>Notie records microphone audio together with your Mac’s system audio and screen recordings.</string>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>Notie records system audio from calls and other apps when you choose Record.</string>
+	<string>Notie records system audio from calls and other apps when you choose Record or Record Screen.</string>
 </dict>
 </plist>

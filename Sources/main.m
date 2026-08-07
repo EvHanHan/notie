@@ -35,6 +35,12 @@ static void NotieLogRecordingError(NSString *message) {
     os_log_error(NotieRecordingLog(), "%{public}@", message ?: @"");
 }
 
+static NSString *NotieRecordingErrorDescription(NSError *error) {
+    if (!error) return @"No NSError was supplied.";
+    NSString *reason = error.localizedFailureReason.length > 0 ? [NSString stringWithFormat:@" — %@", error.localizedFailureReason] : @"";
+    return [NSString stringWithFormat:@"%@ (%@ / %ld)%@", error.localizedDescription ?: @"Unknown error", error.domain ?: @"unknown domain", (long)error.code, reason];
+}
+
 @interface SystemAudioRecorder : NSObject
 @property (nonatomic, readonly) BOOL recording;
 @property (nonatomic, readonly) NSDate *firstBufferDate;
@@ -178,6 +184,135 @@ static void NotieLogRecordingError(NSString *message) {
 }
 @end
 
+@interface ScreenMovieRecorder : NSObject <SCStreamOutput, SCStreamDelegate>
+@property (nonatomic, readonly) BOOL recording;
+@property (nonatomic, readonly) NSDate *firstVideoDate;
+@property (nonatomic, copy) void (^failureHandler)(NSError *error);
+- (BOOL)startWithDisplay:(SCDisplay *)display outputURL:(NSURL *)outputURL error:(NSError **)outError;
+- (void)stopWithCompletion:(void (^)(NSError *error))completion;
+@end
+
+@implementation ScreenMovieRecorder {
+    SCStream *_stream;
+    AVAssetWriter *_writer;
+    AVAssetWriterInput *_videoInput;
+    AVAssetWriterInput *_audioInput;
+    dispatch_queue_t _queue;
+    NSDate *_firstVideoDate;
+    BOOL _sessionStarted;
+    BOOL _stopping;
+    BOOL _reportedFailure;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) _queue = dispatch_queue_create("local.notie.screen-movie", DISPATCH_QUEUE_SERIAL);
+    return self;
+}
+
+- (BOOL)startWithDisplay:(SCDisplay *)display outputURL:(NSURL *)outputURL error:(NSError **)outError {
+    NSError *error = nil;
+    _writer = [[AVAssetWriter alloc] initWithURL:outputURL fileType:AVFileTypeQuickTimeMovie error:&error];
+    if (!_writer) { if (outError) *outError = error; return NO; }
+    size_t width = CGDisplayPixelsWide(display.displayID);
+    size_t height = CGDisplayPixelsHigh(display.displayID);
+    NSDictionary *videoSettings = @{
+        AVVideoCodecKey: AVVideoCodecTypeH264,
+        AVVideoWidthKey: @(width),
+        AVVideoHeightKey: @(height),
+        AVVideoCompressionPropertiesKey: @{AVVideoAverageBitRateKey: @(MIN(24000000, MAX(4000000, width * height * 4)))}
+    };
+    _videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
+    _videoInput.expectsMediaDataInRealTime = YES;
+    _audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:@{AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @48000, AVNumberOfChannelsKey: @2}];
+    _audioInput.expectsMediaDataInRealTime = YES;
+    if (![_writer canAddInput:_videoInput] || ![_writer canAddInput:_audioInput]) {
+        if (outError) *outError = [NSError errorWithDomain:@"Notie.ScreenRecording" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not configure the screen movie writer."}];
+        return NO;
+    }
+    [_writer addInput:_videoInput];
+    [_writer addInput:_audioInput];
+
+    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+    filter.includeMenuBar = YES;
+    SCStreamConfiguration *configuration = [SCStreamConfiguration new];
+    configuration.width = width;
+    configuration.height = height;
+    configuration.pixelFormat = kCVPixelFormatType_32BGRA;
+    configuration.minimumFrameInterval = CMTimeMake(1, 60);
+    configuration.queueDepth = 6;
+    configuration.showsCursor = YES;
+    configuration.capturesAudio = YES;
+    configuration.sampleRate = 48000;
+    configuration.channelCount = 2;
+    configuration.excludesCurrentProcessAudio = YES;
+    _stream = [[SCStream alloc] initWithFilter:filter configuration:configuration delegate:self];
+    if (![_stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:_queue error:&error] ||
+        ![_stream addStreamOutput:self type:SCStreamOutputTypeAudio sampleHandlerQueue:_queue error:&error]) {
+        if (outError) *outError = error;
+        _stream = nil;
+        return NO;
+    }
+    [_stream startCaptureWithCompletionHandler:^(NSError *captureError) {
+        if (captureError) [self reportFailure:captureError];
+        else {
+            self->_recording = YES;
+            NotieLogRecordingMessage(@"ScreenCaptureKit stream started successfully.");
+        }
+    }];
+    return YES;
+}
+
+- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
+    if (_stopping || !CMSampleBufferDataIsReady(sampleBuffer)) return;
+    if (type == SCStreamOutputTypeScreen) {
+        CFArrayRef attachmentArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+        NSDictionary *attachments = attachmentArray && CFArrayGetCount(attachmentArray) > 0 ? (__bridge NSDictionary *)CFArrayGetValueAtIndex(attachmentArray, 0) : nil;
+        NSNumber *frameStatus = attachments[SCStreamFrameInfoStatus];
+        // ScreenCaptureKit also sends lifecycle/idle buffers. They have no complete image
+        // payload and AVAssetWriter fails with AVFoundation -11800 if they are appended.
+        if (!frameStatus || frameStatus.integerValue != SCFrameStatusComplete) return;
+        if (!_sessionStarted) {
+            if (![_writer startWriting]) { [self reportFailure:_writer.error]; return; }
+            [_writer startSessionAtSourceTime:CMSampleBufferGetPresentationTimeStamp(sampleBuffer)];
+            _sessionStarted = YES;
+            _firstVideoDate = NSDate.date;
+        }
+        if (_videoInput.readyForMoreMediaData && ![_videoInput appendSampleBuffer:sampleBuffer]) [self reportFailure:_writer.error];
+    } else if (type == SCStreamOutputTypeAudio && _sessionStarted) {
+        if (_audioInput.readyForMoreMediaData && ![_audioInput appendSampleBuffer:sampleBuffer]) [self reportFailure:_writer.error];
+    }
+}
+
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    if (!_stopping) [self reportFailure:error ?: [NSError errorWithDomain:@"Notie.ScreenRecording" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Screen capture stopped unexpectedly."}]];
+}
+
+- (void)reportFailure:(NSError *)error {
+    if (_reportedFailure) return;
+    _reportedFailure = YES;
+    NSError *resolved = error ?: [NSError errorWithDomain:@"Notie.ScreenRecording" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Screen recording failed."}];
+    NotieLogRecordingError([NSString stringWithFormat:@"Screen recording stream failed: %@", resolved.localizedDescription]);
+    dispatch_async(dispatch_get_main_queue(), ^{ if (self.failureHandler) self.failureHandler(resolved); });
+}
+
+- (void)stopWithCompletion:(void (^)(NSError *error))completion {
+    _stopping = YES;
+    _recording = NO;
+    void (^finishWriter)(void) = ^{
+        if (!self->_sessionStarted) {
+            if (completion) completion([NSError errorWithDomain:@"Notie.ScreenRecording" code:4 userInfo:@{NSLocalizedDescriptionKey: @"No video frames were captured."}]);
+            return;
+        }
+        [self->_videoInput markAsFinished];
+        [self->_audioInput markAsFinished];
+        [self->_writer finishWritingWithCompletionHandler:^{ if (completion) completion(self->_writer.error); }];
+    };
+    if (_stream) [_stream stopCaptureWithCompletionHandler:^(NSError *error) { finishWriter(); }];
+    else finishWriter();
+}
+@end
+
 static NSSet<NSString *> *NotieImageFileExtensions(void) {
     static NSSet<NSString *> *extensions;
     static dispatch_once_t onceToken;
@@ -304,21 +439,27 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property EventHotKeyRef screenshotHotKeyRef;
 @property EventHandlerRef handlerRef;
 @property NSMenuItem *recordMenuItem;
+@property NSMenuItem *screenRecordMenuItem;
 @property NSMenuItem *screenshotMenuItem;
+@property NSMenuItem *recordingLogMenuItem;
 @property NSMenuItem *transcriptionProgressMenuItem;
 @property NSTextField *transcriptionProgressLabel;
 @property NSProgressIndicator *transcriptionProgressIndicator;
 @property NSMenuItem *transcriptionLogMenuItem;
 @property NSMutableArray<NSString *> *transcriptionLogMessages;
+@property NSMutableArray<NSString *> *recordingLogMessages;
 @property AVAudioEngine *audioEngine;
 @property AVAudioMixerNode *microphoneMixer;
 @property SystemAudioRecorder *systemAudioRecorder;
+@property ScreenMovieRecorder *screenMovieRecorder;
 @property AVAudioFile *microphoneFile;
 @property NSDate *microphoneFirstBufferDate;
 @property NSDate *recordingStartedAt;
 @property NSURL *recordingOutputURL;
 @property NSURL *recordingFolderURL;
+@property NSURL *recordingLogURL;
 @property BOOL recording;
+@property BOOL screenRecording;
 @property BOOL screenshotCaptureInProgress;
 @property NSWindow *screenshotFlashWindow;
 @property dispatch_queue_t recordingQueue;
@@ -335,7 +476,11 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 - (void)updateTranscriptionProgressForEvent:(NSString *)event message:(NSString *)message;
 - (void)finishTranscriptionProgressSuccessfully:(BOOL)succeeded;
 - (void)appendTranscriptionLogMessage:(NSString *)message;
+- (void)appendRecordingLogMessage:(NSString *)message;
 - (void)takeRecordingScreenshot;
+- (void)toggleScreenRecording:(id)sender;
+- (void)startScreenRecording;
+- (void)stopScreenRecordingWithError:(NSError *)failure;
 - (void)registerScreenshotHotKey;
 - (void)unregisterScreenshotHotKey;
 - (void)flashPrimaryDisplayForScreenshot;
@@ -363,6 +508,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.recordingQueue = dispatch_queue_create("local.notie.recording", DISPATCH_QUEUE_SERIAL);
     self.activeTranscriptionTasks = [NSMutableSet set];
     self.transcriptionLogMessages = [NSMutableArray array];
+    self.recordingLogMessages = [NSMutableArray array];
     [self buildMainMenu];
     [self buildStatusItem];
     [self buildWindow];
@@ -425,6 +571,10 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.recordMenuItem = [[NSMenuItem alloc] initWithTitle:@"Record" action:@selector(toggleRecording:) keyEquivalent:@""];
     self.recordMenuItem.target = self;
     [menu addItem:self.recordMenuItem];
+    self.screenRecordMenuItem = [[NSMenuItem alloc] initWithTitle:@"Record Screen" action:@selector(toggleScreenRecording:) keyEquivalent:@""];
+    self.screenRecordMenuItem.target = self;
+    self.screenRecordMenuItem.toolTip = @"Capture the primary display, system audio, and microphone into an MP4 file.";
+    [menu addItem:self.screenRecordMenuItem];
     self.screenshotMenuItem = [[NSMenuItem alloc] initWithTitle:@"Take Screenshot" action:@selector(takeRecordingScreenshot) keyEquivalent:@"s"];
     self.screenshotMenuItem.target = self;
     self.screenshotMenuItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
@@ -434,6 +584,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.recordingsFolderMenuItem = [[NSMenuItem alloc] initWithTitle:@"Recordings Folder: None" action:@selector(chooseRecordingsFolder:) keyEquivalent:@""];
     self.recordingsFolderMenuItem.target = self;
     [menu addItem:self.recordingsFolderMenuItem];
+    [self buildRecordingLogMenuItem];
+    [menu addItem:self.recordingLogMenuItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *transcribeAudioItem = [[NSMenuItem alloc] initWithTitle:@"Transcribe Audio or Video File…" action:@selector(chooseAudioFileForTranscription:) keyEquivalent:@""];
@@ -480,6 +632,30 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.transcriptionLogMenuItem = [[NSMenuItem alloc] initWithTitle:@"Transcription log" action:nil keyEquivalent:@""];
     self.transcriptionLogMenuItem.submenu = [[NSMenu alloc] initWithTitle:@"Transcription log"];
     [self appendTranscriptionLogMessage:@"Waiting for the next transcription."];
+}
+
+- (void)buildRecordingLogMenuItem {
+    self.recordingLogMenuItem = [[NSMenuItem alloc] initWithTitle:@"Recording log" action:nil keyEquivalent:@""];
+    self.recordingLogMenuItem.submenu = [[NSMenu alloc] initWithTitle:@"Recording log"];
+    [self appendRecordingLogMessage:@"Waiting for the next recording."];
+}
+
+- (void)appendRecordingLogMessage:(NSString *)message {
+    if (message.length == 0) return;
+    NSString *timestamp = [[NSDateFormatter localizedStringFromDate:NSDate.date dateStyle:NSDateFormatterNoStyle timeStyle:NSDateFormatterMediumStyle] stringByAppendingFormat:@"  %@", message];
+    [self.recordingLogMessages addObject:timestamp];
+    while (self.recordingLogMessages.count > 16) [self.recordingLogMessages removeObjectAtIndex:0];
+    NSMenu *logMenu = self.recordingLogMenuItem.submenu;
+    [logMenu removeAllItems];
+    for (NSString *entry in self.recordingLogMessages) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:entry action:nil keyEquivalent:@""];
+        item.enabled = NO;
+        [logMenu addItem:item];
+    }
+    if (self.recordingLogURL) {
+        NSString *fileContents = [[self.recordingLogMessages componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+        [fileContents writeToURL:self.recordingLogURL atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
 }
 
 - (void)appendTranscriptionLogMessage:(NSString *)message {
@@ -535,7 +711,10 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)toggleRecording:(id)sender {
-    if (self.recording) [self stopRecording];
+    if (self.recording) {
+        if (self.screenRecording) [self stopScreenRecordingWithError:nil];
+        else [self stopRecording];
+    }
     else [self startRecording];
 }
 
@@ -571,6 +750,164 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     } else {
         continueStarting();
     }
+}
+
+- (void)toggleScreenRecording:(id)sender {
+    if (self.recording) {
+        if (self.screenRecording) [self stopScreenRecordingWithError:nil];
+        else [self stopRecording];
+    }
+    else [self startScreenRecording];
+}
+
+- (void)startScreenRecording {
+    [self appendRecordingLogMessage:@"Record Screen requested."];
+    NSError *error = nil;
+    NSURL *recordingsFolderURL = [self recordingsFolderURLWithError:&error];
+    if (!recordingsFolderURL) {
+        [self appendRecordingLogMessage:[NSString stringWithFormat:@"No recordings folder: %@", NotieRecordingErrorDescription(error)]];
+        [self showErrorWithTitle:@"Choose a recordings folder first" message:error.localizedDescription ?: @"Select where Notie should save recordings."];
+        return;
+    }
+    if (!CGPreflightScreenCaptureAccess() && !CGRequestScreenCaptureAccess()) {
+        [self appendRecordingLogMessage:@"Screen Recording permission is not granted."];
+        [self showErrorWithTitle:@"Screen Recording access is required" message:@"Allow Notie in System Settings > Privacy & Security > Screen Recording, then try again."];
+        return;
+    }
+    AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+    if (status == AVAuthorizationStatusDenied || status == AVAuthorizationStatusRestricted) {
+        [self appendRecordingLogMessage:@"Microphone permission is not granted."];
+        [self showErrorWithTitle:@"Microphone access is unavailable" message:@"Allow Notie to use the microphone in System Settings > Privacy & Security > Microphone."];
+        return;
+    }
+    void (^continueStarting)(void) = ^{ dispatch_async(dispatch_get_main_queue(), ^{ [self prepareScreenRecordingWithFolderURL:recordingsFolderURL]; }); };
+    if (status == AVAuthorizationStatusNotDetermined) {
+        [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
+            if (granted) continueStarting();
+            else dispatch_async(dispatch_get_main_queue(), ^{ [self showErrorWithTitle:@"Microphone access is required" message:@"Allow Notie to use the microphone to record screen recordings."]; });
+        }];
+    } else {
+        continueStarting();
+    }
+}
+
+- (void)prepareScreenRecordingWithFolderURL:(NSURL *)recordingsFolderURL {
+    if (self.recording) return;
+    if (![recordingsFolderURL startAccessingSecurityScopedResource]) {
+        [self showErrorWithTitle:@"Couldn’t access recordings folder" message:@"Select the recordings folder again and try recording."];
+        return;
+    }
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSError *error = nil;
+    NSURL *directory = [recordingsFolderURL URLByAppendingPathComponent:@"recordings" isDirectory:YES];
+    if (![fileManager createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:&error]) {
+        [recordingsFolderURL stopAccessingSecurityScopedResource];
+        [self showErrorWithTitle:@"Couldn’t create recordings folder" message:error.localizedDescription ?: @"Notie could not create the recordings folder."];
+        return;
+    }
+    NSURL *sessionURL = [self uniqueURLInDirectory:directory preferredFilename:[NSString stringWithFormat:@"recording-%@", [self timestampString]] fileManager:fileManager];
+    if (![fileManager createDirectoryAtURL:sessionURL withIntermediateDirectories:YES attributes:nil error:&error]) {
+        [recordingsFolderURL stopAccessingSecurityScopedResource];
+        [self showErrorWithTitle:@"Couldn’t start screen recording" message:error.localizedDescription ?: @"Notie could not create the recording folder."];
+        return;
+    }
+
+    self.recordingOutputURL = sessionURL;
+    self.recordingFolderURL = recordingsFolderURL;
+    self.recordingLogURL = [sessionURL URLByAppendingPathComponent:@"recording.log"];
+    [self appendRecordingLogMessage:[NSString stringWithFormat:@"Screen recording session: %@", sessionURL.path]];
+    self.recordingStartedAt = NSDate.date;
+    self.recording = YES;
+    self.screenRecording = YES;
+    self.recordMenuItem.enabled = NO;
+    self.screenRecordMenuItem.enabled = NO;
+    self.screenshotMenuItem.enabled = NO;
+    self.statusItem.button.toolTip = @"Starting screen recording…";
+
+    [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *contentError) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (contentError || !content) {
+                [self appendRecordingLogMessage:[NSString stringWithFormat:@"SCShareableContent failed: %@", NotieRecordingErrorDescription(contentError)]];
+                [self failToStartScreenRecording:contentError ?: [NSError errorWithDomain:@"Notie.ScreenRecording" code:10 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not access the primary display."}]];
+                return;
+            }
+            CGDirectDisplayID mainDisplayID = CGMainDisplayID();
+            SCDisplay *primaryDisplay = nil;
+            for (SCDisplay *display in content.displays) if (display.displayID == mainDisplayID) { primaryDisplay = display; break; }
+            if (!primaryDisplay) {
+                [self appendRecordingLogMessage:@"Primary display was not present in SCShareableContent."];
+                [self failToStartScreenRecording:[NSError errorWithDomain:@"Notie.ScreenRecording" code:11 userInfo:@{NSLocalizedDescriptionKey: @"The primary display is not available for capture."}]];
+                return;
+            }
+            NSURL *temporaryMovieURL = [self.recordingOutputURL URLByAppendingPathComponent:@"screen-temp.mov"];
+            self.screenMovieRecorder = [ScreenMovieRecorder new];
+            __weak AppDelegate *weakSelf = self;
+            self.screenMovieRecorder.failureHandler = ^(NSError *streamError) {
+                AppDelegate *strongSelf = weakSelf;
+                if (strongSelf && strongSelf.screenRecording) [strongSelf stopScreenRecordingWithError:streamError];
+            };
+            NSError *startError = nil;
+            if (![self.screenMovieRecorder startWithDisplay:primaryDisplay outputURL:temporaryMovieURL error:&startError]) {
+                [self appendRecordingLogMessage:[NSString stringWithFormat:@"ScreenCaptureKit setup failed: %@", NotieRecordingErrorDescription(startError)]];
+                [self failToStartScreenRecording:startError];
+                return;
+            }
+            [self appendRecordingLogMessage:[NSString stringWithFormat:@"ScreenCaptureKit configured for %@ × %@; temporary movie: %@", @(CGDisplayPixelsWide(primaryDisplay.displayID)), @(CGDisplayPixelsHigh(primaryDisplay.displayID)), temporaryMovieURL.lastPathComponent]];
+
+            self.audioEngine = [AVAudioEngine new];
+            AVAudioInputNode *inputNode = self.audioEngine.inputNode;
+            AVAudioFormat *inputFormat = [inputNode outputFormatForBus:0];
+            NSURL *microphoneURL = [self.recordingOutputURL URLByAppendingPathComponent:@"mic-temp.wav"];
+            NSDictionary *micSettings = @{AVFormatIDKey: @(kAudioFormatLinearPCM), AVSampleRateKey: @(inputFormat.sampleRate), AVNumberOfChannelsKey: @(inputFormat.channelCount), AVLinearPCMBitDepthKey: @32, AVLinearPCMIsFloatKey: @YES, AVLinearPCMIsBigEndianKey: @NO, AVLinearPCMIsNonInterleaved: @NO};
+            self.microphoneFirstBufferDate = nil;
+            self.microphoneFile = [[AVAudioFile alloc] initForWriting:microphoneURL settings:micSettings error:&startError];
+            if (!self.microphoneFile) { [self appendRecordingLogMessage:[NSString stringWithFormat:@"Microphone file setup failed: %@", NotieRecordingErrorDescription(startError)]]; [self failToStartScreenRecording:startError]; return; }
+            [inputNode installTapOnBus:0 bufferSize:4096 format:inputFormat block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
+                if (!self.microphoneFirstBufferDate) self.microphoneFirstBufferDate = NSDate.date;
+                NSError *writeError = nil;
+                [self.microphoneFile writeFromBuffer:buffer error:&writeError];
+                if (writeError) NotieLogRecordingError([NSString stringWithFormat:@"Screen recording microphone write failed: %@", writeError.localizedDescription]);
+            }];
+            if (![self.audioEngine startAndReturnError:&startError]) {
+                [inputNode removeTapOnBus:0];
+                [self appendRecordingLogMessage:[NSString stringWithFormat:@"Microphone engine failed: %@", NotieRecordingErrorDescription(startError)]];
+                [self failToStartScreenRecording:startError];
+                return;
+            }
+            self.screenRecordMenuItem.title = @"Stop Screen Recording";
+            self.screenRecordMenuItem.enabled = YES;
+            self.screenshotMenuItem.enabled = YES;
+            self.statusItem.button.toolTip = @"Recording screen and audio…";
+            [self registerScreenshotHotKey];
+            [self appendRecordingLogMessage:@"Microphone engine started; waiting for ScreenCaptureKit video frames."];
+            NotieLogRecordingMessage(@"Primary-display screen recording started successfully.");
+        });
+    }];
+}
+
+- (void)failToStartScreenRecording:(NSError *)error {
+    NSURL *sessionURL = self.recordingOutputURL;
+    NSURL *folderURL = self.recordingFolderURL;
+    [self.audioEngine stop];
+    [self.audioEngine.inputNode removeTapOnBus:0];
+    self.audioEngine = nil;
+    self.microphoneFile = nil;
+    ScreenMovieRecorder *movieRecorder = self.screenMovieRecorder;
+    self.screenMovieRecorder = nil;
+    [movieRecorder stopWithCompletion:^(NSError *stopError) {}];
+    self.recording = NO;
+    self.screenRecording = NO;
+    [self appendRecordingLogMessage:[NSString stringWithFormat:@"Screen recording start failed: %@", NotieRecordingErrorDescription(error)]];
+    self.recordingOutputURL = nil;
+    self.recordingFolderURL = nil;
+    self.recordMenuItem.enabled = YES;
+    self.screenRecordMenuItem.enabled = YES;
+    self.screenRecordMenuItem.title = @"Record Screen";
+    [NSFileManager.defaultManager removeItemAtURL:sessionURL error:nil];
+    [folderURL stopAccessingSecurityScopedResource];
+    self.recordingLogURL = nil;
+    NotieLogRecordingError([NSString stringWithFormat:@"Could not start screen recording: %@", error.localizedDescription ?: @"unknown error"]);
+    [self showErrorWithTitle:@"Couldn’t start screen recording" message:error.localizedDescription ?: @"Check Screen Recording and Microphone permission, then try again."];
 }
 
 - (void)prepareRecordingWithFolderURL:(NSURL *)recordingsFolderURL {
@@ -802,6 +1139,154 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     if (![self writeSessionMetadataAtURL:outputURL recordingStart:recordingStart microphoneStart:microphoneStart systemStart:systemStart endedAt:NSDate.date error:&metadataError]) {
         NotieLogRecordingError([NSString stringWithFormat:@"Could not write recording metadata: %@", metadataError.localizedDescription ?: @"unknown error"]);
     }
+}
+
+- (void)stopScreenRecordingWithError:(NSError *)failure {
+    if (!self.screenRecording) return;
+    [self appendRecordingLogMessage:failure ? [NSString stringWithFormat:@"Stopping after capture error: %@", NotieRecordingErrorDescription(failure)] : @"Stop Screen Recording requested."];
+    NSURL *sessionURL = self.recordingOutputURL;
+    NSURL *folderURL = self.recordingFolderURL;
+    NSURL *temporaryMovieURL = [sessionURL URLByAppendingPathComponent:@"screen-temp.mov"];
+    NSURL *microphoneURL = [sessionURL URLByAppendingPathComponent:@"mic-temp.wav"];
+    NSDate *microphoneStart = self.microphoneFirstBufferDate ?: self.recordingStartedAt ?: NSDate.date;
+    NSDate *recordingStart = self.recordingStartedAt ?: microphoneStart;
+    ScreenMovieRecorder *movieRecorder = self.screenMovieRecorder;
+
+    self.recording = NO;
+    self.screenRecording = NO;
+    [self unregisterScreenshotHotKey];
+    self.screenshotMenuItem.enabled = NO;
+    self.recordMenuItem.enabled = YES;
+    self.screenRecordMenuItem.enabled = NO;
+    self.screenRecordMenuItem.title = @"Record Screen";
+    self.statusItem.button.toolTip = failure ? @"Screen recording stopped" : @"Finalizing screen recording…";
+    [self.audioEngine stop];
+    [self.audioEngine.inputNode removeTapOnBus:0];
+    self.audioEngine = nil;
+    self.microphoneFile = nil;
+    self.screenMovieRecorder = nil;
+
+    [movieRecorder stopWithCompletion:^(NSError *stopError) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSError *resolvedFailure = failure ?: stopError;
+            if (resolvedFailure) {
+                [self appendRecordingLogMessage:[NSString stringWithFormat:@"Capture finalization failed: %@", NotieRecordingErrorDescription(resolvedFailure)]];
+                [NSFileManager.defaultManager removeItemAtURL:sessionURL error:nil];
+                [folderURL stopAccessingSecurityScopedResource];
+                self.recordingOutputURL = nil;
+                self.recordingFolderURL = nil;
+                self.recordingStartedAt = nil;
+                self.recordingLogURL = nil;
+                self.screenRecordMenuItem.enabled = YES;
+                NotieLogRecordingError([NSString stringWithFormat:@"Screen recording stopped without a final video: %@", resolvedFailure.localizedDescription ?: @"unknown error"]);
+                [self showErrorWithTitle:@"Screen recording stopped" message:resolvedFailure.localizedDescription ?: @"Notie could not finish the screen recording."];
+                return;
+            }
+            NSDate *videoStart = movieRecorder.firstVideoDate ?: recordingStart;
+            [self appendRecordingLogMessage:[NSString stringWithFormat:@"Capture finalized; exporting MP4 (video start %@, mic start %@).", videoStart, microphoneStart]];
+            [self exportScreenMovieAtURL:temporaryMovieURL microphoneURL:microphoneURL outputURL:[sessionURL URLByAppendingPathComponent:@"screen-recording.mp4"] microphoneStart:microphoneStart videoStart:videoStart completion:^(NSError *exportError) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSURL *finalURL = [sessionURL URLByAppendingPathComponent:@"screen-recording.mp4"];
+                    if (exportError) {
+                        [self appendRecordingLogMessage:[NSString stringWithFormat:@"MP4 export failed: %@", NotieRecordingErrorDescription(exportError)]];
+                        [NSFileManager.defaultManager removeItemAtURL:finalURL error:nil];
+                        [folderURL stopAccessingSecurityScopedResource];
+                        self.recordingOutputURL = nil;
+                        self.recordingFolderURL = nil;
+                        self.recordingStartedAt = nil;
+                        self.recordingLogURL = nil;
+                        self.screenRecordMenuItem.enabled = YES;
+                        NotieLogRecordingError([NSString stringWithFormat:@"Screen recording export failed: %@", exportError.localizedDescription ?: @"unknown error"]);
+                        [self showErrorWithTitle:@"Couldn’t create MP4" message:[NSString stringWithFormat:@"The temporary recording was kept in %@. %@", sessionURL.path ?: @"the recording folder", exportError.localizedDescription ?: @"Notie could not mix the audio into the video."]];
+                        return;
+                    }
+                    [NSFileManager.defaultManager removeItemAtURL:temporaryMovieURL error:nil];
+                    [NSFileManager.defaultManager removeItemAtURL:microphoneURL error:nil];
+                    [self appendRecordingLogMessage:@"MP4 export completed; temporary capture files removed."];
+                    NSError *metadataError = nil;
+                    if (![self writeScreenSessionMetadataAtURL:sessionURL recordingStart:recordingStart videoStart:videoStart microphoneStart:microphoneStart endedAt:NSDate.date error:&metadataError]) {
+                        NotieLogRecordingError([NSString stringWithFormat:@"Could not write screen recording metadata: %@", metadataError.localizedDescription ?: @"unknown error"]);
+                    }
+                    [folderURL stopAccessingSecurityScopedResource];
+                    self.recordingOutputURL = nil;
+                    self.recordingFolderURL = nil;
+                    self.recordingStartedAt = nil;
+                    self.recordingLogURL = nil;
+                    self.screenRecordMenuItem.enabled = YES;
+                    self.statusItem.button.toolTip = @"Screen recording saved";
+                    NSUserNotification *notification = [NSUserNotification new];
+                    notification.title = @"Screen recording saved";
+                    notification.informativeText = finalURL.path ?: @"screen-recording.mp4";
+                    [[NSUserNotificationCenter defaultUserNotificationCenter] deliverNotification:notification];
+                    NotieLogRecordingMessage([NSString stringWithFormat:@"Screen recording saved successfully: %@", finalURL.path ?: @"unknown"]);
+                });
+            }];
+        });
+    }];
+}
+
+- (void)exportScreenMovieAtURL:(NSURL *)movieURL microphoneURL:(NSURL *)microphoneURL outputURL:(NSURL *)outputURL microphoneStart:(NSDate *)microphoneStart videoStart:(NSDate *)videoStart completion:(void (^)(NSError *error))completion {
+    AVURLAsset *movieAsset = [AVURLAsset URLAssetWithURL:movieURL options:nil];
+    AVAssetTrack *videoTrack = [[movieAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    AVAssetTrack *systemAudioTrack = [[movieAsset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    AVURLAsset *microphoneAsset = [AVURLAsset URLAssetWithURL:microphoneURL options:nil];
+    AVAssetTrack *microphoneTrack = [[microphoneAsset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+    if (!videoTrack) {
+        if (completion) completion([NSError errorWithDomain:@"Notie.ScreenRecording" code:20 userInfo:@{NSLocalizedDescriptionKey: @"The screen capture did not contain video."}]);
+        return;
+    }
+    NSError *error = nil;
+    AVMutableComposition *composition = [AVMutableComposition composition];
+    AVMutableCompositionTrack *compositionVideo = [composition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+    CMTimeRange videoRange = CMTimeRangeMake(kCMTimeZero, movieAsset.duration);
+    if (![compositionVideo insertTimeRange:videoRange ofTrack:videoTrack atTime:kCMTimeZero error:&error]) { if (completion) completion(error); return; }
+    NSMutableArray<AVAudioMixInputParameters *> *audioParameters = [NSMutableArray array];
+    if (systemAudioTrack) {
+        AVMutableCompositionTrack *systemAudio = [composition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+        if (![systemAudio insertTimeRange:CMTimeRangeMake(kCMTimeZero, movieAsset.duration) ofTrack:systemAudioTrack atTime:kCMTimeZero error:&error]) { if (completion) completion(error); return; }
+        [audioParameters addObject:[AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:systemAudio]];
+    }
+    if (microphoneTrack) {
+        NSTimeInterval offsetSeconds = [microphoneStart timeIntervalSinceDate:videoStart];
+        CMTime sourceStart = offsetSeconds < 0 ? CMTimeMakeWithSeconds(-offsetSeconds, 600) : kCMTimeZero;
+        CMTime destinationStart = offsetSeconds > 0 ? CMTimeMakeWithSeconds(offsetSeconds, 600) : kCMTimeZero;
+        CMTime availableDuration = CMTimeSubtract(microphoneAsset.duration, sourceStart);
+        if (CMTIME_COMPARE_INLINE(availableDuration, >, kCMTimeZero)) {
+            AVMutableCompositionTrack *micAudio = [composition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+            if (![micAudio insertTimeRange:CMTimeRangeMake(sourceStart, availableDuration) ofTrack:microphoneTrack atTime:destinationStart error:&error]) { if (completion) completion(error); return; }
+            [audioParameters addObject:[AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:micAudio]];
+        }
+    }
+    [NSFileManager.defaultManager removeItemAtURL:outputURL error:nil];
+    AVAssetExportSession *exporter = [[AVAssetExportSession alloc] initWithAsset:composition presetName:AVAssetExportPresetHighestQuality];
+    if (!exporter || ![exporter.supportedFileTypes containsObject:AVFileTypeMPEG4]) {
+        if (completion) completion([NSError errorWithDomain:@"Notie.ScreenRecording" code:21 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not create an MP4 export session."}]);
+        return;
+    }
+    exporter.outputURL = outputURL;
+    exporter.outputFileType = AVFileTypeMPEG4;
+    if (audioParameters.count > 0) {
+        AVMutableAudioMix *audioMix = [AVMutableAudioMix audioMix];
+        audioMix.inputParameters = audioParameters;
+        exporter.audioMix = audioMix;
+    }
+    [exporter exportAsynchronouslyWithCompletionHandler:^{
+        NSError *exportError = exporter.status == AVAssetExportSessionStatusCompleted ? nil : (exporter.error ?: [NSError errorWithDomain:@"Notie.ScreenRecording" code:22 userInfo:@{NSLocalizedDescriptionKey: @"Notie could not export the final MP4."}]);
+        if (completion) completion(exportError);
+    }];
+}
+
+- (BOOL)writeScreenSessionMetadataAtURL:(NSURL *)sessionURL recordingStart:(NSDate *)started videoStart:(NSDate *)videoStart microphoneStart:(NSDate *)microphoneStart endedAt:(NSDate *)endedAt error:(NSError **)outError {
+    NSDate *earliest = [videoStart earlierDate:microphoneStart];
+    NSISO8601DateFormatter *formatter = [NSISO8601DateFormatter new];
+    NSDictionary *metadata = @{
+        @"started": [formatter stringFromDate:started], @"ended": [formatter stringFromDate:endedAt],
+        @"duration_seconds": @((NSInteger)MAX(0, round([endedAt timeIntervalSinceDate:videoStart]))),
+        @"files": @{@"video": @"screen-recording.mp4"},
+        @"start_offset_ms": @{@"video": @((NSInteger)MAX(0, round([videoStart timeIntervalSinceDate:earliest] * 1000.0))), @"mic": @((NSInteger)MAX(0, round([microphoneStart timeIntervalSinceDate:earliest] * 1000.0)))}
+    };
+    NSData *data = [NSJSONSerialization dataWithJSONObject:metadata options:NSJSONWritingPrettyPrinted error:outError];
+    return data && [data writeToURL:[sessionURL URLByAppendingPathComponent:@"meta.json"] options:NSDataWritingAtomic error:outError];
 }
 
 - (BOOL)writeSessionMetadataAtURL:(NSURL *)sessionURL recordingStart:(NSDate *)started microphoneStart:(NSDate *)microphoneStart systemStart:(NSDate *)systemStart endedAt:(NSDate *)endedAt error:(NSError **)outError {
