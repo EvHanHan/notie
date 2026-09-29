@@ -11,6 +11,8 @@ static NSString * const MarkdownFileBookmarkKey = @"MarkdownFileBookmark";
 static NSString * const MarkdownFilePathKey = @"MarkdownFilePath";
 static NSString * const RecordingsFolderBookmarkKey = @"RecordingsFolderBookmark";
 static NSString * const RecordingsFolderPathKey = @"RecordingsFolderPath";
+static NSString * const LastRecordingFolderPathKey = @"LastRecordingFolderPath";
+static NSString * const LastTranscriptFilePathKey = @"LastTranscriptFilePath";
 static NSString * const SaveDestinationKey = @"SaveDestination";
 static NSString * const SaveDestinationMarkdown = @"markdown";
 static NSString * const SaveDestinationAppleNotes = @"appleNotes";
@@ -216,12 +218,7 @@ static NSString *NotieRecordingErrorDescription(NSError *error) {
     if (!_writer) { if (outError) *outError = error; return NO; }
     size_t width = CGDisplayPixelsWide(display.displayID);
     size_t height = CGDisplayPixelsHigh(display.displayID);
-    NSDictionary *videoSettings = @{
-        AVVideoCodecKey: AVVideoCodecTypeH264,
-        AVVideoWidthKey: @(width),
-        AVVideoHeightKey: @(height),
-        AVVideoCompressionPropertiesKey: @{AVVideoAverageBitRateKey: @(MIN(24000000, MAX(4000000, width * height * 4)))}
-    };
+    NSDictionary *videoSettings = @{AVVideoCodecKey: AVVideoCodecTypeH264, AVVideoWidthKey: @(width), AVVideoHeightKey: @(height), AVVideoCompressionPropertiesKey: @{AVVideoAverageBitRateKey: @(MIN(24000000, MAX(4000000, width * height * 4)))}};
     _videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
     _videoInput.expectsMediaDataInRealTime = YES;
     _audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:@{AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @48000, AVNumberOfChannelsKey: @2}];
@@ -232,7 +229,6 @@ static NSString *NotieRecordingErrorDescription(NSError *error) {
     }
     [_writer addInput:_videoInput];
     [_writer addInput:_audioInput];
-
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
     filter.includeMenuBar = YES;
     SCStreamConfiguration *configuration = [SCStreamConfiguration new];
@@ -247,18 +243,14 @@ static NSString *NotieRecordingErrorDescription(NSError *error) {
     configuration.channelCount = 2;
     configuration.excludesCurrentProcessAudio = YES;
     _stream = [[SCStream alloc] initWithFilter:filter configuration:configuration delegate:self];
-    if (![_stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:_queue error:&error] ||
-        ![_stream addStreamOutput:self type:SCStreamOutputTypeAudio sampleHandlerQueue:_queue error:&error]) {
+    if (![_stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:_queue error:&error] || ![_stream addStreamOutput:self type:SCStreamOutputTypeAudio sampleHandlerQueue:_queue error:&error]) {
         if (outError) *outError = error;
         _stream = nil;
         return NO;
     }
     [_stream startCaptureWithCompletionHandler:^(NSError *captureError) {
         if (captureError) [self reportFailure:captureError];
-        else {
-            self->_recording = YES;
-            NotieLogRecordingMessage(@"ScreenCaptureKit stream started successfully.");
-        }
+        else { self->_recording = YES; NotieLogRecordingMessage(@"ScreenCaptureKit stream started successfully."); }
     }];
     return YES;
 }
@@ -269,8 +261,6 @@ static NSString *NotieRecordingErrorDescription(NSError *error) {
         CFArrayRef attachmentArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
         NSDictionary *attachments = attachmentArray && CFArrayGetCount(attachmentArray) > 0 ? (__bridge NSDictionary *)CFArrayGetValueAtIndex(attachmentArray, 0) : nil;
         NSNumber *frameStatus = attachments[SCStreamFrameInfoStatus];
-        // ScreenCaptureKit also sends lifecycle/idle buffers. They have no complete image
-        // payload and AVAssetWriter fails with AVFoundation -11800 if they are appended.
         if (!frameStatus || frameStatus.integerValue != SCFrameStatusComplete) return;
         if (!_sessionStarted) {
             if (![_writer startWriting]) { [self reportFailure:_writer.error]; return; }
@@ -300,10 +290,7 @@ static NSString *NotieRecordingErrorDescription(NSError *error) {
     _stopping = YES;
     _recording = NO;
     void (^finishWriter)(void) = ^{
-        if (!self->_sessionStarted) {
-            if (completion) completion([NSError errorWithDomain:@"Notie.ScreenRecording" code:4 userInfo:@{NSLocalizedDescriptionKey: @"No video frames were captured."}]);
-            return;
-        }
+        if (!self->_sessionStarted) { if (completion) completion([NSError errorWithDomain:@"Notie.ScreenRecording" code:4 userInfo:@{NSLocalizedDescriptionKey: @"No video frames were captured."}]); return; }
         [self->_videoInput markAsFinished];
         [self->_audioInput markAsFinished];
         [self->_writer finishWritingWithCompletionHandler:^{ if (completion) completion(self->_writer.error); }];
@@ -431,16 +418,16 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSPopUpButton *destinationPopUp;
 @property NSMenuItem *markdownTargetMenuItem;
 @property NSMenuItem *recordingsFolderMenuItem;
+@property NSMenuItem *openRecordingFolderMenuItem;
+@property NSMenuItem *openTranscriptFolderMenuItem;
 @property NSView *bottomBar;
 @property NSMutableArray<NSDictionary *> *pendingImages;
 @property NSMapTable<NSTextAttachment *, NSString *> *attachmentImageIDs;
 @property EKEventStore *eventStore;
 @property EventHotKeyRef hotKeyRef;
-@property EventHotKeyRef screenshotHotKeyRef;
 @property EventHandlerRef handlerRef;
 @property NSMenuItem *recordMenuItem;
 @property NSMenuItem *screenRecordMenuItem;
-@property NSMenuItem *screenshotMenuItem;
 @property NSMenuItem *recordingLogMenuItem;
 @property NSMenuItem *transcriptionProgressMenuItem;
 @property NSTextField *transcriptionProgressLabel;
@@ -460,8 +447,6 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 @property NSURL *recordingLogURL;
 @property BOOL recording;
 @property BOOL screenRecording;
-@property BOOL screenshotCaptureInProgress;
-@property NSWindow *screenshotFlashWindow;
 @property dispatch_queue_t recordingQueue;
 @property NSMutableSet<NSTask *> *activeTranscriptionTasks;
 - (void)showCaptureWindow:(id)sender;
@@ -469,6 +454,8 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 - (void)startTranscriptionForSessionAtURL:(NSURL *)sessionURL completion:(NotieTranscriptionCompletion)completion;
 - (void)chooseAudioFileForTranscription:(id)sender;
 - (void)transcribeAudioFileAtURL:(NSURL *)audioURL;
+- (void)openRecordingFolder:(id)sender;
+- (void)openTranscriptFolder:(id)sender;
 - (BOOL)convertAudioAtURL:(NSURL *)inputURL toWAVAtURL:(NSURL *)outputURL duration:(NSTimeInterval *)outDuration error:(NSError **)outError;
 - (BOOL)extractAudioFromMediaAtURL:(NSURL *)inputURL toM4AAtURL:(NSURL *)outputURL error:(NSError **)outError;
 - (NSArray<NSURL *> *)availableTranscriptURLsForAudioURL:(NSURL *)audioURL;
@@ -477,14 +464,9 @@ static NSArray<NSPasteboardType> *NotiePasteboardImageTypes(void) {
 - (void)finishTranscriptionProgressSuccessfully:(BOOL)succeeded;
 - (void)appendTranscriptionLogMessage:(NSString *)message;
 - (void)appendRecordingLogMessage:(NSString *)message;
-- (void)takeRecordingScreenshot;
 - (void)toggleScreenRecording:(id)sender;
 - (void)startScreenRecording;
 - (void)stopScreenRecordingWithError:(NSError *)failure;
-- (void)registerScreenshotHotKey;
-- (void)unregisterScreenshotHotKey;
-- (void)flashPrimaryDisplayForScreenshot;
-- (BOOL)validateMenuItem:(NSMenuItem *)menuItem;
 @end
 
 static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, void *userData) {
@@ -494,7 +476,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     dispatch_async(dispatch_get_main_queue(), ^{
         if (hotKeyID.signature != 'NOTI') return;
         if (hotKeyID.id == 1) [delegate showCaptureWindow:nil];
-        else if (hotKeyID.id == 2) [delegate takeRecordingScreenshot];
     });
     return noErr;
 }
@@ -516,7 +497,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
-    [self unregisterScreenshotHotKey];
     if (_hotKeyRef) UnregisterEventHotKey(_hotKeyRef);
     if (_handlerRef) RemoveEventHandler(_handlerRef);
 }
@@ -575,15 +555,12 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.screenRecordMenuItem.target = self;
     self.screenRecordMenuItem.toolTip = @"Capture the primary display, system audio, and microphone into an MP4 file.";
     [menu addItem:self.screenRecordMenuItem];
-    self.screenshotMenuItem = [[NSMenuItem alloc] initWithTitle:@"Take Screenshot" action:@selector(takeRecordingScreenshot) keyEquivalent:@"s"];
-    self.screenshotMenuItem.target = self;
-    self.screenshotMenuItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
-    self.screenshotMenuItem.enabled = NO;
-    self.screenshotMenuItem.toolTip = @"Available while recording. Saves a screenshot in the active recording folder.";
-    [menu addItem:self.screenshotMenuItem];
     self.recordingsFolderMenuItem = [[NSMenuItem alloc] initWithTitle:@"Recordings Folder: None" action:@selector(chooseRecordingsFolder:) keyEquivalent:@""];
     self.recordingsFolderMenuItem.target = self;
     [menu addItem:self.recordingsFolderMenuItem];
+    self.openRecordingFolderMenuItem = [[NSMenuItem alloc] initWithTitle:@"Open Recording Folder" action:@selector(openRecordingFolder:) keyEquivalent:@""];
+    self.openRecordingFolderMenuItem.target = self;
+    [menu addItem:self.openRecordingFolderMenuItem];
     [self buildRecordingLogMenuItem];
     [menu addItem:self.recordingLogMenuItem];
     [menu addItem:[NSMenuItem separatorItem]];
@@ -591,6 +568,9 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSMenuItem *transcribeAudioItem = [[NSMenuItem alloc] initWithTitle:@"Transcribe Audio or Video File…" action:@selector(chooseAudioFileForTranscription:) keyEquivalent:@""];
     transcribeAudioItem.target = self;
     [menu addItem:transcribeAudioItem];
+    self.openTranscriptFolderMenuItem = [[NSMenuItem alloc] initWithTitle:@"Open Transcript Folder" action:@selector(openTranscriptFolder:) keyEquivalent:@""];
+    self.openTranscriptFolderMenuItem.target = self;
+    [menu addItem:self.openTranscriptFolderMenuItem];
     [self buildTranscriptionProgressMenuItem];
     [menu addItem:self.transcriptionProgressMenuItem];
     [self buildTranscriptionLogMenuItem];
@@ -821,7 +801,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.screenRecording = YES;
     self.recordMenuItem.enabled = NO;
     self.screenRecordMenuItem.enabled = NO;
-    self.screenshotMenuItem.enabled = NO;
     self.statusItem.button.toolTip = @"Starting screen recording…";
 
     [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *contentError) {
@@ -876,9 +855,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
             }
             self.screenRecordMenuItem.title = @"Stop Screen Recording";
             self.screenRecordMenuItem.enabled = YES;
-            self.screenshotMenuItem.enabled = YES;
             self.statusItem.button.toolTip = @"Recording screen and audio…";
-            [self registerScreenshotHotKey];
             [self appendRecordingLogMessage:@"Microphone engine started; waiting for ScreenCaptureKit video frames."];
             NotieLogRecordingMessage(@"Primary-display screen recording started successfully.");
         });
@@ -999,9 +976,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.recordingStartedAt = NSDate.date;
     self.recording = YES;
     self.recordMenuItem.title = @"Stop Recording";
-    self.screenshotMenuItem.enabled = YES;
     self.statusItem.button.toolTip = @"Recording audio…";
-    [self registerScreenshotHotKey];
     NotieLogRecordingMessage(@"Microphone and Core Audio system recording started successfully.");
 }
 
@@ -1097,8 +1072,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSDate *systemStart = self.systemAudioRecorder.firstBufferDate ?: self.recordingStartedAt ?: NSDate.date;
     NSDate *recordingStart = self.recordingStartedAt ?: [microphoneStart earlierDate:systemStart];
     self.recording = NO;
-    [self unregisterScreenshotHotKey];
-    self.screenshotMenuItem.enabled = NO;
     if (failure) NotieLogRecordingError([NSString stringWithFormat:@"Stopping recording because of error: %@", failure.localizedDescription ?: @"unknown error"]);
     else NotieLogRecordingMessage(@"Stopping microphone and Core Audio system recording normally.");
     self.recordMenuItem.title = @"Record";
@@ -1130,6 +1103,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         return;
     }
     NotieLogRecordingMessage([NSString stringWithFormat:@"Recording saved successfully: %@", outputURL.path ?: @"unknown"]);
+    [NSUserDefaults.standardUserDefaults setObject:outputURL.path forKey:LastRecordingFolderPathKey];
+    [self updateTargetControls];
     NSUserNotification *notification = [NSUserNotification new];
     notification.title = @"Recording saved";
     notification.informativeText = merged ? [NSString stringWithFormat:@"Merged audio: %@", mergedURL.path ?: @"ready"] : (outputURL.path ?: @"The audio files are ready.");
@@ -1154,8 +1129,6 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
 
     self.recording = NO;
     self.screenRecording = NO;
-    [self unregisterScreenshotHotKey];
-    self.screenshotMenuItem.enabled = NO;
     self.recordMenuItem.enabled = YES;
     self.screenRecordMenuItem.enabled = NO;
     self.screenRecordMenuItem.title = @"Record Screen";
@@ -1575,6 +1548,10 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
                 [fileManager removeItemAtURL:jobURL error:nil];
                 [audioURL stopAccessingSecurityScopedResource];
                 if (!saved && outError) *outError = copyError;
+                if (saved) {
+                    [NSUserDefaults.standardUserDefaults setObject:markdownURL.path forKey:LastTranscriptFilePathKey];
+                    [self updateTargetControls];
+                }
                 return saved;
             }];
         });
@@ -1663,6 +1640,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     RegisterEventHotKey(kVK_ANSI_K, cmdKey, hotKeyID, GetApplicationEventTarget(), 0, &_hotKeyRef);
 }
 
+#if 0 // Standalone screenshot capture removed.
 - (void)registerScreenshotHotKey {
     if (self.screenshotHotKeyRef || !self.recording) return;
     EventHotKeyID hotKeyID;
@@ -1803,6 +1781,8 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
         flashWindow.alphaValue = 1.0;
     }];
 }
+
+#endif
 
 - (void)showCaptureWindow:(id)sender {
     [NSApp activateIgnoringOtherApps:YES];
@@ -1992,6 +1972,38 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     [self updateTargetControls];
 }
 
+- (void)openRecordingFolder:(id)sender {
+    NSString *lastRecordingPath = [NSUserDefaults.standardUserDefaults stringForKey:LastRecordingFolderPathKey];
+    NSURL *lastRecordingURL = lastRecordingPath.length > 0 ? [NSURL fileURLWithPath:lastRecordingPath isDirectory:YES] : nil;
+    if (lastRecordingURL && [[NSFileManager defaultManager] fileExistsAtPath:lastRecordingURL.path]) {
+        [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[lastRecordingURL]];
+        return;
+    }
+
+    NSURL *recordingsFolderURL = [self currentRecordingsFolderURL];
+    if (!recordingsFolderURL) {
+        [self showErrorWithTitle:@"No recording folder yet" message:@"Choose a recordings folder first, then record audio."];
+        return;
+    }
+    NSURL *sessionsURL = [recordingsFolderURL URLByAppendingPathComponent:@"recordings" isDirectory:YES];
+    NSURL *folderToOpen = [[NSFileManager defaultManager] fileExistsAtPath:sessionsURL.path] ? sessionsURL : recordingsFolderURL;
+    [[NSWorkspace sharedWorkspace] openURL:folderToOpen];
+}
+
+- (void)openTranscriptFolder:(id)sender {
+    NSString *transcriptPath = [NSUserDefaults.standardUserDefaults stringForKey:LastTranscriptFilePathKey];
+    if (transcriptPath.length == 0) {
+        [self showErrorWithTitle:@"No transcript yet" message:@"Transcribe an audio or video file first."];
+        return;
+    }
+    NSURL *transcriptURL = [NSURL fileURLWithPath:transcriptPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:transcriptURL.path]) {
+        [self showErrorWithTitle:@"Transcript not found" message:@"The most recent transcript was moved or deleted. Transcribe another file to update this menu item."];
+        return;
+    }
+    [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[transcriptURL]];
+}
+
 - (void)positionPanelNearMenuBarWhenShown:(NSPanel *)panel {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSScreen *screen = NSScreen.mainScreen;
@@ -2110,6 +2122,14 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     NSString *recordingsFolderTitle = recordingsFolderPath.length > 0 ? [NSString stringWithFormat:@"Recordings Folder: %@", recordingsFolderPath.lastPathComponent] : @"Recordings Folder: None";
     self.recordingsFolderMenuItem.title = recordingsFolderTitle;
     self.recordingsFolderMenuItem.toolTip = recordingsFolderPath.length > 0 ? recordingsFolderPath : @"Click to choose where recordings are saved.";
+    NSString *lastRecordingPath = [NSUserDefaults.standardUserDefaults stringForKey:LastRecordingFolderPathKey];
+    BOOL hasRecording = lastRecordingPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:lastRecordingPath];
+    self.openRecordingFolderMenuItem.enabled = hasRecording || recordingsFolderPath.length > 0;
+    self.openRecordingFolderMenuItem.toolTip = hasRecording ? lastRecordingPath : (recordingsFolderPath.length > 0 ? [recordingsFolderPath stringByAppendingPathComponent:@"recordings"] : @"Record audio first, or choose where recordings are saved.");
+    NSString *transcriptPath = [NSUserDefaults.standardUserDefaults stringForKey:LastTranscriptFilePathKey];
+    BOOL hasTranscript = transcriptPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:transcriptPath];
+    self.openTranscriptFolderMenuItem.enabled = hasTranscript;
+    self.openTranscriptFolderMenuItem.toolTip = hasTranscript ? transcriptPath : @"Transcribe an audio or video file first.";
 }
 
 - (NSString *)selectedSaveDestination {
