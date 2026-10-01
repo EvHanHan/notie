@@ -1594,7 +1594,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, v
     self.textView.typingAttributes = @{NSFontAttributeName: spotlightLikeFont, NSForegroundColorAttributeName: NSColor.labelColor};
     self.textView.textColor = NSColor.labelColor;
     self.textView.backgroundColor = NSColor.textBackgroundColor;
-    self.textView.textContainerInset = NSMakeSize(14, 12);
+    self.textView.textContainerInset = NSMakeSize(8, 6);
     self.textView.richText = YES;
     self.textView.importsGraphics = NO;
     self.textView.allowsUndo = YES;
